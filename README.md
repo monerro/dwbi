@@ -7,19 +7,19 @@ made for counterblox (https://www.roblox.com/games/301549746/Counter-Blox)
 
 
 includes:
-aimbot
-pixelsurf
-texturebug
-esp
-minijump
-longjump
-wallhop
-wallstuck
-jumpbug
-venthop assist (soon)
-watermark
-larp watermark
-velocity graph (soon)
-momentum 
-indicators (rework)
-skinchanger
+- aimbot
+- pixelsurf
+- texturebug
+- esp
+- minijump
+- longjump
+- wallhop
+- wallstuck
+- jumpbug
+- venthop assist (soon)
+- watermark
+- larp watermark
+- velocity graph (soon)
+- momentum
+- indicators (rework)
+- skinchanger

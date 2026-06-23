@@ -1,6 +1,6 @@
 -- ================================================================
--- dwbi | movement module
--- Toggle menu: [INSERT] key
+-- dwbi | movement + ESP  (Clarity menu)
+-- Toggle menu: [INSERT]   |   Unload: hold U + O
 -- ================================================================
 
 local Players          = game:GetService("Players")
@@ -8,6 +8,9 @@ local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
+local mouse  = player:GetMouse()
+local camera = workspace.CurrentCamera
+
 local character, humanoid, hrp
 
 local function bindCharacter(char)
@@ -19,21 +22,51 @@ if player.Character then bindCharacter(player.Character) end
 player.CharacterAdded:Connect(bindCharacter)
 
 -- ================================================================
--- CONFIG
+-- CONFIG (movement + visuals)
 -- ================================================================
 local cfg = {
     pixelMaxSpeed   = 40,
     textureMaxSpeed = 40,
     bhopBoost       = 3.0,
-    jumpBugPower    = 80,   -- extra Y velocity when jumpbug fires  [Q hold]
-    longJumpPower   = 90,   -- horizontal burst on longjump         [E press]
-    miniJumpPower   = 20,   -- Y velocity for minijump              [C press]
-    aimbotFOV       = 60,   -- degrees radius to search for targets
-    aimbotSmooth    = 6,    -- lerp speed (lower = snappier)
-    aimbotButton    = Enum.UserInputType.MouseButton2,  -- default RMB
+    jumpBugPower    = 80,
+    longJumpPower   = 90,
+    miniJumpPower   = 20,
+    aimbotFOV       = 60,
+    aimbotSmooth    = 6,
+    aimbotButton    = Enum.UserInputType.MouseButton2,
     fogEnd          = 200,
-    fogStart        = 0,
     blurSize        = 10,
+}
+
+-- ESP defaults
+local ESP_CFG = {
+    skeleton_color         = Color3.fromRGB(0, 255, 0),
+    crouch_color           = Color3.fromRGB(255, 0, 0),
+    skeleton_thickness     = 2,
+    skeleton_transparency  = 1,
+    crouch_detection       = true,
+    crouch_height_threshold = 2,
+    box_enabled            = true,
+    box_color              = Color3.fromRGB(255, 255, 255),
+    box_thickness          = 2,
+    box_filled             = false,
+    box_fill_color         = Color3.fromRGB(255, 255, 255),
+    box_fill_transparency  = 0.2,
+    healthbar_enabled      = true,
+    healthbar_color_high   = Color3.fromRGB(0, 255, 0),
+    healthbar_color_low    = Color3.fromRGB(255, 0, 0),
+    name_enabled           = true,
+    name_color             = Color3.fromRGB(255, 255, 255),
+    name_size              = 14,
+    name_outline           = true,
+    distance_enabled       = true,
+    distance_color         = Color3.fromRGB(200, 200, 200),
+    distance_size          = 12,
+    tracer_enabled         = false,
+    tracer_color           = Color3.fromRGB(255, 255, 255),
+    tracer_thickness       = 1,
+    tracer_transparency    = 1,
+    tracer_from            = "Bottom",
 }
 
 local WALL_RANGE  = 2.0
@@ -43,7 +76,7 @@ local TRAIL_LIFE  = 1.8
 local TRAIL_WIDTH = 0.06
 
 -- ================================================================
--- FEATURE STATE
+-- FEATURE STATE (movement)
 -- ================================================================
 local features = {
     PixelSurf  = { enabled=false, conn=nil, surfing=false, glideDir=nil, glideSpeed=0 },
@@ -56,8 +89,14 @@ local features = {
     FakeAimbot = { enabled=false, conn=nil },
 }
 
+-- ESP state
+local espEnabled = false
+local espConn = nil
+local espObjects = {}        -- player -> { drawings }
+local crouching = {}
+
 -- ================================================================
--- RAYCAST HELPERS
+-- RAYCAST (movement surf) – reliable original wall finder
 -- ================================================================
 local PARAMS = RaycastParams.new()
 PARAMS.FilterType = Enum.RaycastFilterType.Exclude
@@ -70,12 +109,12 @@ local WALL_DIRS = {
 }
 
 local function castDown(origin, dist)
-    PARAMS.FilterDescendantsInstances = { character }
+    PARAMS.FilterDescendantsInstances = {character}
     return workspace:Raycast(origin, Vector3.new(0, -dist, 0), PARAMS)
 end
 
 local function findWall(originOffset)
-    PARAMS.FilterDescendantsInstances = { character }
+    PARAMS.FilterDescendantsInstances = {character}
     local up     = Vector3.new(0, 1, 0)
     local origin = hrp.Position + originOffset
     local vel    = hrp and hrp.AssemblyLinearVelocity or Vector3.zero
@@ -86,31 +125,18 @@ local function findWall(originOffset)
         if not hit then continue end
 
         local n = hit.Normal
+        -- allow any wall that isn't floor/ceiling (dot < 0.43)
+        if math.abs(n:Dot(up)) >= 0.43 then continue end
 
-        -- 1. Normal must be nearly horizontal (loosened from 0.43 to 0.55)
-        if math.abs(n:Dot(up)) >= 0.55 then continue end
-
-        -- 2. The hit surface must be a BasePart.
-        --    Lowered halfH threshold from 2.0 to 0.8 to allow smaller wall segments.
         local inst = hit.Instance
         if not inst:IsA("BasePart") then continue end
-        local halfH = inst.Size.Y * 0.5
-        if halfH < 0.8 then continue end
+        -- reject tiny props / floor lips
+        if inst.Size.Y * 0.5 < 2.0 then continue end
 
-        -- 3. We must not be actively moving away from the wall.
-        --    Lowered threshold from 0.1 to -0.2 to allow shallow approach angles.
+        -- if we have horizontal velocity, require moving toward the wall
         if hVel.Magnitude > 1 then
-            local toward = -n
-            if hVel.Unit:Dot(toward) < -0.2 then continue end
+            if hVel.Unit:Dot(-n) < 0.1 then continue end
         end
-
-        -- 4. Confirm something exists above or below (not just same instance).
-        --    Allows segmented/stacked walls to be detected properly.
-        local hitPos = hit.Position
-        local upCheck   = workspace:Raycast(hitPos + up * 0.1,   dir * (WALL_RANGE + 0.5), PARAMS)
-        local downCheck = workspace:Raycast(hitPos - up * 0.1,   dir * (WALL_RANGE + 0.5), PARAMS)
-        local wallContinues = (upCheck ~= nil) or (downCheck ~= nil)
-        if not wallContinues then continue end
 
         return n
     end
@@ -118,13 +144,13 @@ local function findWall(originOffset)
 end
 
 -- ================================================================
--- TRAIL
+-- TRAIL (cosmetic)
 -- ================================================================
 local trailFolder = Instance.new("Folder")
 trailFolder.Name = "DwbiTrail"; trailFolder.Parent = workspace
 
 local segments = {}
-local lastPos  = { PixelSurf=nil, TextureBug=nil }
+local lastPos  = {PixelSurf=nil, TextureBug=nil}
 local TRAIL_STEP = 1.2
 
 local function spawnSegment(pos)
@@ -152,61 +178,59 @@ local function updateTrail(pos, active, key)
 end
 
 -- ================================================================
--- SURF (shared by PixelSurf + TextureBug)
+-- SURF (PixelSurf + TextureBug) – original, A/D cancels, W accelerates
 -- ================================================================
 local function makeSurf(key, originOffset, getMaxSpeed)
-    local f=features[key]
-    f.conn=RunService.Heartbeat:Connect(function(dt)
+    local f = features[key]
+    f.conn = RunService.Heartbeat:Connect(function(dt)
         if not hrp or not humanoid then return end
-        local state=humanoid:GetState()
-        local airborne=state==Enum.HumanoidStateType.Freefall
-                    or state==Enum.HumanoidStateType.Jumping
+        local state = humanoid:GetState()
+        local airborne = state == Enum.HumanoidStateType.Freefall
+                      or state == Enum.HumanoidStateType.Jumping
         if not airborne then
-            f.surfing=false; f.glideDir=nil; f.glideSpeed=0
-            updateTrail(hrp.Position,false,key); return
+            f.surfing = false; f.glideDir = nil; f.glideSpeed = 0
+            updateTrail(hrp.Position, false, key); return
         end
-        local wNormal=findWall(originOffset)
+        local wNormal = findWall(originOffset)
         if not wNormal then
-            f.surfing=false; f.glideDir=nil; f.glideSpeed=0
-            updateTrail(hrp.Position,false,key); return
+            f.surfing = false; f.glideDir = nil; f.glideSpeed = 0
+            updateTrail(hrp.Position, false, key); return
         end
+        -- A/D cancels surf so you can strafe off
         if f.surfing and (
             UserInputService:IsKeyDown(Enum.KeyCode.A) or
             UserInputService:IsKeyDown(Enum.KeyCode.D) or
             UserInputService:IsKeyDown(Enum.KeyCode.Left) or
             UserInputService:IsKeyDown(Enum.KeyCode.Right)) then
-            f.surfing=false; f.glideDir=nil; f.glideSpeed=0
-            updateTrail(hrp.Position,false,key); return
+            f.surfing = false; f.glideDir = nil; f.glideSpeed = 0
+            updateTrail(hrp.Position, false, key); return
         end
-        local maxSpd=getMaxSpeed()
+        local maxSpd = getMaxSpeed()
         if not f.surfing then
-            f.surfing=true
-            local look=hrp.CFrame.LookVector
-            local proj=look-wNormal*look:Dot(wNormal)
-            proj=Vector3.new(proj.X,0,proj.Z)
-            f.glideDir=proj.Magnitude>0.01 and proj.Unit
-                       or Vector3.new(-wNormal.Z,0,wNormal.X).Unit
-            local vel=hrp.AssemblyLinearVelocity
-            -- clamp entry speed to the configured max immediately
-            f.glideSpeed=math.min(
-                math.max(Vector3.new(vel.X,0,vel.Z).Magnitude,BASE_SPEED),
+            f.surfing = true
+            local look = hrp.CFrame.LookVector
+            local proj = look - wNormal * look:Dot(wNormal)
+            proj = Vector3.new(proj.X, 0, proj.Z)
+            f.glideDir = proj.Magnitude > 0.01 and proj.Unit
+                       or Vector3.new(-wNormal.Z, 0, wNormal.X).Unit
+            local vel = hrp.AssemblyLinearVelocity
+            f.glideSpeed = math.min(
+                math.max(Vector3.new(vel.X, 0, vel.Z).Magnitude, BASE_SPEED),
                 maxSpd)
         end
-        -- always hard-clamp to maxSpd every frame
-        f.glideSpeed=math.min(f.glideSpeed,maxSpd)
-        if UserInputService:IsKeyDown(Enum.KeyCode.W)
-        or UserInputService:IsKeyDown(Enum.KeyCode.Up) then
-            f.glideSpeed=math.min(f.glideSpeed+W_ACCEL*dt,maxSpd)
+        f.glideSpeed = math.min(f.glideSpeed, maxSpd)
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up) then
+            f.glideSpeed = math.min(f.glideSpeed + W_ACCEL * dt, maxSpd)
         end
-        hrp.AssemblyLinearVelocity=Vector3.new(
-            f.glideDir.X*f.glideSpeed,0,f.glideDir.Z*f.glideSpeed)
+        hrp.AssemblyLinearVelocity = Vector3.new(
+            f.glideDir.X * f.glideSpeed, 0, f.glideDir.Z * f.glideSpeed)
         humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-        updateTrail(hrp.Position+originOffset,true,key)
+        updateTrail(hrp.Position + originOffset, true, key)
     end)
 end
 
 -- ================================================================
--- AUTOBHOP  [hold SPACE]
+-- OTHER MOVEMENT FEATURES (unchanged)
 -- ================================================================
 local function bhop_start()
     features.AutoBhop.conn=RunService.RenderStepped:Connect(function()
@@ -221,57 +245,41 @@ local function bhop_start()
     end)
 end
 
--- ================================================================
--- EDGEBUG
--- ================================================================
-local eb_wasGrounded = false
-local eb_lastGroundHit = false
-
+local eb_wasGrounded=false
 local function edgebug_start()
     features.EdgeBug.conn=RunService.Heartbeat:Connect(function()
         if not hrp or not humanoid then return end
         local state=humanoid:GetState()
         local onGround = state==Enum.HumanoidStateType.Running
                       or state==Enum.HumanoidStateType.RunningNoPhysics
-
         local moveDir=humanoid.MoveDirection
-        local checkOrigin = hrp.Position + (moveDir.Magnitude>0 and moveDir or hrp.CFrame.LookVector) * 1.8
-        local floorAhead  = castDown(checkOrigin, 4.5)
-        local floorBelow  = castDown(hrp.Position, 3.5)
-
+        local checkOrigin=hrp.Position+(moveDir.Magnitude>0 and moveDir or hrp.CFrame.LookVector)*1.8
+        local floorAhead=castDown(checkOrigin,4.5)
+        local floorBelow=castDown(hrp.Position,3.5)
         if onGround then
-            eb_wasGrounded = true
+            eb_wasGrounded=true
             if floorBelow and not floorAhead then
                 local vel=hrp.AssemblyLinearVelocity
                 humanoid.Jump=true
                 task.defer(function()
                     if hrp then
-                        hrp.AssemblyLinearVelocity=Vector3.new(vel.X, hrp.AssemblyLinearVelocity.Y, vel.Z)
+                        hrp.AssemblyLinearVelocity=Vector3.new(vel.X,hrp.AssemblyLinearVelocity.Y,vel.Z)
                     end
                 end)
             end
         end
-
-        if state==Enum.HumanoidStateType.Landed then
-            eb_wasGrounded=false
-        end
+        if state==Enum.HumanoidStateType.Landed then eb_wasGrounded=false end
     end)
 end
 
--- ================================================================
--- JUMPBUG  [hold Q]
--- ================================================================
 local function jumpbug_start()
-    features.JumpBug.conn=humanoid.StateChanged:Connect(function(_, new)
+    features.JumpBug.conn=humanoid.StateChanged:Connect(function(_,new)
         if new==Enum.HumanoidStateType.Jumping then
             if UserInputService:IsKeyDown(Enum.KeyCode.Q) then
                 task.defer(function()
                     if hrp then
                         local vel=hrp.AssemblyLinearVelocity
-                        hrp.AssemblyLinearVelocity=Vector3.new(
-                            vel.X,
-                            vel.Y + cfg.jumpBugPower,
-                            vel.Z)
+                        hrp.AssemblyLinearVelocity=Vector3.new(vel.X,vel.Y+cfg.jumpBugPower,vel.Z)
                     end
                 end)
             end
@@ -279,48 +287,32 @@ local function jumpbug_start()
     end)
 end
 
--- ================================================================
--- LONGJUMP  [press E on ground]
--- ================================================================
-local lj_used = false
-
+local lj_used=false
 local function longjump_start()
-    features.LongJump.conn=UserInputService.InputBegan:Connect(function(input, gpe)
+    features.LongJump.conn=UserInputService.InputBegan:Connect(function(input,gpe)
         if gpe then return end
         if input.KeyCode~=Enum.KeyCode.E then return end
         if not humanoid or not hrp then return end
         local state=humanoid:GetState()
-        if state~=Enum.HumanoidStateType.Running
-        and state~=Enum.HumanoidStateType.RunningNoPhysics then return end
+        if state~=Enum.HumanoidStateType.Running and state~=Enum.HumanoidStateType.RunningNoPhysics then return end
         if lj_used then return end
         lj_used=true
-
         local look=hrp.CFrame.LookVector
         local vel=hrp.AssemblyLinearVelocity
-        hrp.AssemblyLinearVelocity=Vector3.new(
-            look.X * cfg.longJumpPower,
-            vel.Y + 25,
-            look.Z * cfg.longJumpPower)
+        hrp.AssemblyLinearVelocity=Vector3.new(look.X*cfg.longJumpPower,vel.Y+25,look.Z*cfg.longJumpPower)
         humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-
         local landConn
-        landConn=humanoid.StateChanged:Connect(function(_, new)
-            if new==Enum.HumanoidStateType.Landed
-            or new==Enum.HumanoidStateType.Running then
-                lj_used=false
-                landConn:Disconnect()
+        landConn=humanoid.StateChanged:Connect(function(_,new)
+            if new==Enum.HumanoidStateType.Landed or new==Enum.HumanoidStateType.Running then
+                lj_used=false; landConn:Disconnect()
             end
         end)
     end)
 end
 
--- ================================================================
--- MINIJUMP  [press C on ground]
--- ================================================================
-local mj_cd = 0
-
+local mj_cd=0
 local function minijump_start()
-    features.MiniJump.conn=UserInputService.InputBegan:Connect(function(input, gpe)
+    features.MiniJump.conn=UserInputService.InputBegan:Connect(function(input,gpe)
         if gpe then return end
         if input.KeyCode~=Enum.KeyCode.C then return end
         if not humanoid or not hrp then return end
@@ -328,82 +320,67 @@ local function minijump_start()
         if now-mj_cd<0.3 then return end
         mj_cd=now
         local state=humanoid:GetState()
-        if state~=Enum.HumanoidStateType.Running
-        and state~=Enum.HumanoidStateType.RunningNoPhysics then return end
-
+        if state~=Enum.HumanoidStateType.Running and state~=Enum.HumanoidStateType.RunningNoPhysics then return end
         local vel=hrp.AssemblyLinearVelocity
-        hrp.AssemblyLinearVelocity=Vector3.new(vel.X, cfg.miniJumpPower, vel.Z)
+        hrp.AssemblyLinearVelocity=Vector3.new(vel.X,cfg.miniJumpPower,vel.Z)
         humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
     end)
 end
 
 -- ================================================================
--- FAKE AIMBOT  [hold right mouse button]
+-- FAKE AIMBOT (cosmetic)
 -- ================================================================
-local camera = workspace.CurrentCamera
-
 local function isEnemy(p)
-    local myTeam = player.Team
-    if myTeam == nil then return true end
-    return p.Team ~= myTeam
+    local myTeam=player.Team
+    if myTeam==nil then return true end
+    return p.Team~=myTeam
 end
 
 local function getNearestHead()
-    local closest, closestDist = nil, math.huge
-    local camCF   = camera.CFrame
-    local camPos  = camCF.Position
-    local camLook = camCF.LookVector
-    local fovRad  = math.rad(cfg.aimbotFOV)
-
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p == player then continue end
+    local closest,closestDist=nil,math.huge
+    local camCF=camera.CFrame
+    local camPos=camCF.Position
+    local camLook=camCF.LookVector
+    local fovRad=math.rad(cfg.aimbotFOV)
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p==player then continue end
         if not isEnemy(p) then continue end
-        local char = p.Character
+        local char=p.Character
         if not char then continue end
-        local head = char:FindFirstChild("Head")
-        local hum  = char:FindFirstChildOfClass("Humanoid")
-        if not head or not hum or hum.Health <= 0 then continue end
-
-        local toHead = (head.Position - camPos)
-        local dist   = toHead.Magnitude
-        local angle  = math.acos(math.clamp(camLook:Dot(toHead.Unit), -1, 1))
-        if angle > fovRad then continue end
-
-        if dist < closestDist then
-            closestDist = dist
-            closest = head
-        end
+        local head=char:FindFirstChild("Head")
+        local hum=char:FindFirstChildOfClass("Humanoid")
+        if not head or not hum or hum.Health<=0 then continue end
+        local toHead=(head.Position-camPos)
+        local dist=toHead.Magnitude
+        local angle=math.acos(math.clamp(camLook:Dot(toHead.Unit),-1,1))
+        if angle>fovRad then continue end
+        if dist<closestDist then closestDist=dist; closest=head end
     end
     return closest
 end
 
 local function fakeaimbot_start()
-    features.FakeAimbot.conn = RunService.RenderStepped:Connect(function(dt)
-        local held = false
-        local btn = cfg.aimbotButton
-        if typeof(btn) == "EnumItem" then
-            if btn.EnumType == Enum.UserInputType then
-                held = UserInputService:IsMouseButtonPressed(btn)
-            elseif btn.EnumType == Enum.KeyCode then
-                held = UserInputService:IsKeyDown(btn)
+    features.FakeAimbot.conn=RunService.RenderStepped:Connect(function(dt)
+        local held=false
+        local btn=cfg.aimbotButton
+        if typeof(btn)=="EnumItem" then
+            if btn.EnumType==Enum.UserInputType then
+                held=UserInputService:IsMouseButtonPressed(btn)
+            elseif btn.EnumType==Enum.KeyCode then
+                held=UserInputService:IsKeyDown(btn)
             end
         end
         if not held then return end
-
-        local head = getNearestHead()
+        local head=getNearestHead()
         if not head then return end
-
-        local targetPos = head.Position
-        local camPos    = camera.CFrame.Position
-        local direction = (targetPos - camPos).Unit
-
-        local targetCF = CFrame.lookAt(camPos, camPos + direction)
-        camera.CFrame  = camera.CFrame:Lerp(targetCF, math.min(dt * cfg.aimbotSmooth, 1))
+        local dir=(head.Position-camera.CFrame.Position).Unit
+        camera.CFrame=camera.CFrame:Lerp(CFrame.lookAt(camera.CFrame.Position,camera.CFrame.Position+dir),
+            math.min(dt*cfg.aimbotSmooth,1))
     end)
 end
 
 -- ================================================================
--- STOP / TOGGLE
+-- STOP / TOGGLE movement features
 -- ================================================================
 local function stopFeature(key)
     local f=features[key]
@@ -414,6 +391,8 @@ local function stopFeature(key)
     end
     if key=="LongJump" then lj_used=false end
 end
+
+local refreshIndicators  -- forward declare
 
 local function toggleFeature(key)
     local f=features[key]
@@ -429,21 +408,451 @@ local function toggleFeature(key)
         elseif key=="FakeAimbot" then fakeaimbot_start()
         end
     else stopFeature(key) end
-    refreshIndicators()
+    if refreshIndicators then refreshIndicators() end
     return f.enabled
 end
 
 -- ================================================================
--- VISUALS
+-- ESP SYSTEM (Drawing library)
+-- ================================================================
+
+-- Bone definitions
+local r15_bones = {
+    {"Head", "UpperTorso"},
+    {"UpperTorso", "LowerTorso"},
+    {"UpperTorso", "LeftUpperArm"},
+    {"LeftUpperArm", "LeftLowerArm"},
+    {"LeftLowerArm", "LeftHand"},
+    {"UpperTorso", "RightUpperArm"},
+    {"RightUpperArm", "RightLowerArm"},
+    {"RightLowerArm", "RightHand"},
+    {"LowerTorso", "LeftUpperLeg"},
+    {"LeftUpperLeg", "LeftLowerLeg"},
+    {"LeftLowerLeg", "LeftFoot"},
+    {"LowerTorso", "RightUpperLeg"},
+    {"RightUpperLeg", "RightLowerLeg"},
+    {"RightLowerLeg", "RightFoot"}
+}
+
+local r6_bones = {
+    {"Head", "Torso"},
+    {"Torso", "Left Arm"},
+    {"Torso", "Right Arm"},
+    {"Torso", "Left Leg"},
+    {"Torso", "Right Leg"}
+}
+
+local custom_bones = {
+    {"Head", "Torso"},
+    {"Torso", "Left Upper Arm"},
+    {"Left Upper Arm", "Left Lower Arm"},
+    {"Left Lower Arm", "Left Hand"},
+    {"Torso", "Right Upper Arm"},
+    {"Right Upper Arm", "Right Lower Arm"},
+    {"Right Lower Arm", "Right Hand"},
+    {"Torso", "Left Upper Leg"},
+    {"Left Upper Leg", "Left Lower Leg"},
+    {"Left Lower Leg", "Left Foot"},
+    {"Torso", "Right Upper Leg"},
+    {"Right Upper Leg", "Right Lower Leg"},
+    {"Right Lower Leg", "Right Foot"}
+}
+
+local function w2s(pos)
+    local vec, onscreen = camera:WorldToViewportPoint(pos)
+    return Vector2.new(vec.X, vec.Y), onscreen
+end
+
+local function create_line()
+    local line = Drawing.new("Line")
+    line.Visible = false
+    line.Thickness = ESP_CFG.skeleton_thickness
+    line.Color = ESP_CFG.skeleton_color
+    line.Transparency = ESP_CFG.skeleton_transparency
+    return line
+end
+
+local function create_text()
+    local text = Drawing.new("Text")
+    text.Visible = false
+    text.Center = true
+    text.Outline = true
+    text.Font = 2
+    return text
+end
+
+local function create_square()
+    local square = Drawing.new("Square")
+    square.Visible = false
+    square.Filled = false
+    return square
+end
+
+local function cl(p)
+    if espObjects[p] then
+        if espObjects[p].lines then
+            for _, bone_data in pairs(espObjects[p].lines) do
+                if bone_data.line then bone_data.line:Remove() end
+            end
+        end
+        if espObjects[p].box then espObjects[p].box:Remove() end
+        if espObjects[p].box_outline then espObjects[p].box_outline:Remove() end
+        if espObjects[p].box_fill then espObjects[p].box_fill:Remove() end
+        if espObjects[p].healthbar_bg then espObjects[p].healthbar_bg:Remove() end
+        if espObjects[p].healthbar then espObjects[p].healthbar:Remove() end
+        if espObjects[p].name then espObjects[p].name:Remove() end
+        if espObjects[p].distance then espObjects[p].distance:Remove() end
+        if espObjects[p].tracer then espObjects[p].tracer:Remove() end
+        if espObjects[p].tracer_outline then espObjects[p].tracer_outline:Remove() end
+        espObjects[p] = nil
+    end
+    crouching[p] = nil
+end
+
+local function rig(c)
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if h and h.RigType == Enum.HumanoidRigType.R15 then return r15_bones end
+    if c:FindFirstChild("Left Upper Arm") then return custom_bones end
+    return r6_bones
+end
+
+local function makeESP(p)
+    if not p:IsA("Player") or not espEnabled then return end
+    if p.Team == player.Team and p.Team ~= nil then   -- team check enabled by default
+        cl(p)
+        return
+    end
+
+    cl(p)
+
+    local c = p.Character
+    if not c then return end
+
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return end
+
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    if ESP_CFG.crouch_detection then
+        crouching[p] = h.HipHeight < ESP_CFG.crouch_height_threshold
+    end
+
+    local bones = rig(c)
+    local lines = {}
+
+    -- Skeleton
+    for _, bone in pairs(bones) do
+        local part1 = c:FindFirstChild(bone[1])
+        local part2 = c:FindFirstChild(bone[2])
+        if part1 and part2 then
+            local line = create_line()
+            table.insert(lines, {line = line, p1 = part1, p2 = part2})
+        end
+    end
+
+    -- Box
+    local box = ESP_CFG.box_enabled and create_square() or nil
+    local box_outline = (ESP_CFG.box_enabled and ESP_CFG.box_thickness > 0) and create_square() or nil
+    local box_fill = (ESP_CFG.box_enabled and ESP_CFG.box_filled) and create_square() or nil
+    if box_outline then
+        box_outline.Thickness = ESP_CFG.box_thickness + 1
+        box_outline.Color = Color3.new(0, 0, 0)
+    end
+    if box_fill then
+        box_fill.Filled = true
+        box_fill.Color = ESP_CFG.box_fill_color
+        box_fill.Transparency = ESP_CFG.box_fill_transparency
+    end
+
+    -- Health bar
+    local healthbar_bg = ESP_CFG.healthbar_enabled and create_square() or nil
+    local healthbar = ESP_CFG.healthbar_enabled and create_square() or nil
+    if healthbar_bg then
+        healthbar_bg.Filled = true
+        healthbar_bg.Color = Color3.new(0, 0, 0)
+        healthbar_bg.Transparency = 0.5
+    end
+    if healthbar then
+        healthbar.Filled = true
+    end
+
+    -- Name
+    local name_text = ESP_CFG.name_enabled and create_text() or nil
+    if name_text then
+        name_text.Size = ESP_CFG.name_size
+        name_text.Color = ESP_CFG.name_color
+        name_text.Outline = ESP_CFG.name_outline
+    end
+
+    -- Distance
+    local distance_text = ESP_CFG.distance_enabled and create_text() or nil
+    if distance_text then
+        distance_text.Size = ESP_CFG.distance_size
+        distance_text.Color = ESP_CFG.distance_color
+        distance_text.Outline = true
+    end
+
+    -- Tracer
+    local tracer = ESP_CFG.tracer_enabled and create_line() or nil
+    local tracer_outline = (ESP_CFG.tracer_enabled and ESP_CFG.tracer_thickness > 1) and create_line() or nil
+    if tracer then
+        tracer.Thickness = ESP_CFG.tracer_thickness
+        tracer.Color = ESP_CFG.tracer_color
+        tracer.Transparency = ESP_CFG.tracer_transparency
+    end
+    if tracer_outline then
+        tracer_outline.Thickness = ESP_CFG.tracer_thickness + 2
+        tracer_outline.Color = Color3.new(0, 0, 0)
+        tracer_outline.Transparency = ESP_CFG.tracer_transparency * 0.5
+    end
+
+    espObjects[p] = {
+        lines = lines,
+        character = c,
+        humanoid = h,
+        box = box,
+        box_outline = box_outline,
+        box_fill = box_fill,
+        healthbar_bg = healthbar_bg,
+        healthbar = healthbar,
+        name = name_text,
+        distance = distance_text,
+        tracer = tracer,
+        tracer_outline = tracer_outline
+    }
+end
+
+local function get_character_bounds(c)
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local corners = {}
+    local size = hrp.Size
+    local cf = hrp.CFrame
+    local offsets = {
+        Vector3.new(size.X/2, size.Y/2, size.Z/2),
+        Vector3.new(-size.X/2, size.Y/2, size.Z/2),
+        Vector3.new(size.X/2, -size.Y/2, size.Z/2),
+        Vector3.new(-size.X/2, -size.Y/2, size.Z/2),
+        Vector3.new(size.X/2, size.Y/2, -size.Z/2),
+        Vector3.new(-size.X/2, size.Y/2, -size.Z/2),
+        Vector3.new(size.X/2, -size.Y/2, -size.Z/2),
+        Vector3.new(-size.X/2, -size.Y/2, -size.Z/2)
+    }
+    for _, offset in pairs(offsets) do
+        local worldPos = cf:PointToWorldSpace(offset)
+        local screenPos, onScreen = w2s(worldPos)
+        if onScreen then table.insert(corners, screenPos) end
+    end
+    if #corners == 0 then return nil end
+    local minX, maxX = math.huge, -math.huge
+    local minY, maxY = math.huge, -math.huge
+    for _, corner in pairs(corners) do
+        minX = math.min(minX, corner.X)
+        maxX = math.max(maxX, corner.X)
+        minY = math.min(minY, corner.Y)
+        maxY = math.max(maxY, corner.Y)
+    end
+    return {
+        topLeft = Vector2.new(minX, minY),
+        size = Vector2.new(maxX - minX, maxY - minY),
+        center = Vector2.new((minX + maxX) / 2, (minY + maxY) / 2)
+    }
+end
+
+local function updateESP()
+    for p, data in pairs(espObjects) do
+        local c = data.character
+        local h = data.humanoid
+        if not c or not c.Parent or not h or h.Health <= 0 then
+            cl(p)
+            continue
+        end
+        local hrp = c:FindFirstChild("HumanoidRootPart")
+        if not hrp then cl(p); continue end
+
+        if ESP_CFG.crouch_detection and h then
+            crouching[p] = h.HipHeight < ESP_CFG.crouch_height_threshold
+        end
+        local is_crouching = crouching[p]
+        local skel_color = is_crouching and ESP_CFG.crouch_color or ESP_CFG.skeleton_color
+
+        -- Skeleton
+        if data.lines then
+            for _, bone_data in pairs(data.lines) do
+                local line = bone_data.line
+                local p1 = bone_data.p1
+                local p2 = bone_data.p2
+                if p1 and p1.Parent and p2 and p2.Parent then
+                    local pos1, on1 = w2s(p1.Position)
+                    local pos2, on2 = w2s(p2.Position)
+                    if on1 and on2 then
+                        line.From = pos1
+                        line.To = pos2
+                        line.Color = skel_color
+                        line.Thickness = ESP_CFG.skeleton_thickness
+                        line.Transparency = ESP_CFG.skeleton_transparency
+                        line.Visible = true
+                    else
+                        line.Visible = false
+                    end
+                else
+                    line.Visible = false
+                end
+            end
+        end
+
+        local bounds = get_character_bounds(c)
+        if bounds then
+            -- Box
+            if ESP_CFG.box_enabled and data.box then
+                if data.box_outline then
+                    data.box_outline.Position = bounds.topLeft - Vector2.new(1, 1)
+                    data.box_outline.Size = bounds.size + Vector2.new(2, 2)
+                    data.box_outline.Visible = true
+                end
+                if data.box_fill then
+                    data.box_fill.Position = bounds.topLeft
+                    data.box_fill.Size = bounds.size
+                    data.box_fill.Visible = true
+                end
+                data.box.Position = bounds.topLeft
+                data.box.Size = bounds.size
+                data.box.Color = ESP_CFG.box_color
+                data.box.Thickness = ESP_CFG.box_thickness
+                data.box.Visible = true
+            else
+                if data.box then data.box.Visible = false end
+                if data.box_outline then data.box_outline.Visible = false end
+                if data.box_fill then data.box_fill.Visible = false end
+            end
+
+            -- Health bar
+            if ESP_CFG.healthbar_enabled and data.healthbar and data.healthbar_bg then
+                local barWidth = 3
+                local barHeight = bounds.size.Y
+                local healthPercent = h.Health / h.MaxHealth
+                data.healthbar_bg.Position = Vector2.new(bounds.topLeft.X - barWidth - 3, bounds.topLeft.Y)
+                data.healthbar_bg.Size = Vector2.new(barWidth, barHeight)
+                data.healthbar_bg.Visible = true
+                local currentHeight = barHeight * healthPercent
+                data.healthbar.Position = Vector2.new(bounds.topLeft.X - barWidth - 3, bounds.topLeft.Y + barHeight - currentHeight)
+                data.healthbar.Size = Vector2.new(barWidth, currentHeight)
+                data.healthbar.Color = ESP_CFG.healthbar_color_high:Lerp(ESP_CFG.healthbar_color_low, 1 - healthPercent)
+                data.healthbar.Visible = true
+            else
+                if data.healthbar then data.healthbar.Visible = false end
+                if data.healthbar_bg then data.healthbar_bg.Visible = false end
+            end
+
+            -- Name
+            if ESP_CFG.name_enabled and data.name then
+                data.name.Text = p.DisplayName
+                data.name.Position = Vector2.new(bounds.center.X, bounds.topLeft.Y - 15)
+                data.name.Color = ESP_CFG.name_color
+                data.name.Size = ESP_CFG.name_size
+                data.name.Visible = true
+            else
+                if data.name then data.name.Visible = false end
+            end
+
+            -- Distance
+            if ESP_CFG.distance_enabled and data.distance then
+                local dist = (hrp.Position - camera.CFrame.Position).Magnitude
+                data.distance.Text = string.format("%d studs", math.floor(dist))
+                data.distance.Position = Vector2.new(bounds.center.X, bounds.topLeft.Y + bounds.size.Y + 2)
+                data.distance.Color = ESP_CFG.distance_color
+                data.distance.Size = ESP_CFG.distance_size
+                data.distance.Visible = true
+            else
+                if data.distance then data.distance.Visible = false end
+            end
+        else
+            if data.box then data.box.Visible = false end
+            if data.box_outline then data.box_outline.Visible = false end
+            if data.box_fill then data.box_fill.Visible = false end
+            if data.healthbar then data.healthbar.Visible = false end
+            if data.healthbar_bg then data.healthbar_bg.Visible = false end
+            if data.name then data.name.Visible = false end
+            if data.distance then data.distance.Visible = false end
+        end
+
+        -- Tracers
+        if ESP_CFG.tracer_enabled and data.tracer then
+            local pos, onscreen = w2s(hrp.Position)
+            if onscreen then
+                local fromPos
+                if ESP_CFG.tracer_from == "Bottom" then
+                    fromPos = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
+                elseif ESP_CFG.tracer_from == "Middle" then
+                    fromPos = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
+                elseif ESP_CFG.tracer_from == "Top" then
+                    fromPos = Vector2.new(camera.ViewportSize.X / 2, 0)
+                elseif ESP_CFG.tracer_from == "Mouse" then
+                    fromPos = Vector2.new(mouse.X, mouse.Y)
+                end
+                if data.tracer_outline then
+                    data.tracer_outline.From = fromPos
+                    data.tracer_outline.To = pos
+                    data.tracer_outline.Visible = true
+                end
+                data.tracer.From = fromPos
+                data.tracer.To = pos
+                data.tracer.Color = ESP_CFG.tracer_color
+                data.tracer.Visible = true
+            else
+                data.tracer.Visible = false
+                if data.tracer_outline then data.tracer_outline.Visible = false end
+            end
+        else
+            if data.tracer then data.tracer.Visible = false end
+            if data.tracer_outline then data.tracer_outline.Visible = false end
+        end
+    end
+end
+
+local function refreshESP()
+    if not espEnabled then
+        for _, p in pairs(Players:GetPlayers()) do cl(p) end
+        return
+    end
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= player then makeESP(p) end
+    end
+end
+
+local function toggleESP(enabled)
+    espEnabled = enabled
+    if enabled then
+        refreshESP()
+        espConn = RunService.RenderStepped:Connect(updateESP)
+    else
+        if espConn then espConn:Disconnect(); espConn = nil end
+        for _, p in pairs(Players:GetPlayers()) do cl(p) end
+    end
+end
+
+-- Hook ESP into player events
+Players.PlayerAdded:Connect(function(p)
+    if not espEnabled then return end
+    p.CharacterAdded:Connect(function()
+        task.wait(1)
+        if p ~= player and espEnabled then makeESP(p) end
+    end)
+end)
+Players.PlayerRemoving:Connect(function(p)
+    if espEnabled then cl(p) end
+end)
+
+-- ================================================================
+-- VISUALS (fog, blur)
 -- ================================================================
 local Lighting = game:GetService("Lighting")
-
 local origFogEnd   = Lighting.FogEnd
 local origFogStart = Lighting.FogStart
 local origFogColor = Lighting.FogColor
-
 local blurEffect = nil
-local fogConn = nil
+local fogConn, blurConn = nil, nil
 
 local function setFog(enabled)
     if enabled then
@@ -455,7 +864,7 @@ local function setFog(enabled)
             end)
         end)
     else
-        if fogConn then fogConn:Disconnect(); fogConn=nil end
+        if fogConn then fogConn:Disconnect(); fogConn = nil end
         pcall(function()
             Lighting.FogEnd   = origFogEnd
             Lighting.FogStart = origFogStart
@@ -464,895 +873,804 @@ local function setFog(enabled)
     end
 end
 
-local blurConn = nil
 local prevCamPos = nil
-
 local function setBlur(enabled)
     if enabled then
         if not blurEffect then
-            blurEffect        = Instance.new("BlurEffect")
-            blurEffect.Size   = 0
+            blurEffect = Instance.new("BlurEffect")
+            blurEffect.Size = 0
             blurEffect.Parent = Lighting
         end
         prevCamPos = camera.CFrame.Position
         blurConn = RunService.RenderStepped:Connect(function()
             if not blurEffect then return end
-            local curPos  = camera.CFrame.Position
-            local moved   = (curPos - prevCamPos).Magnitude
-            local target  = math.clamp(moved * cfg.blurSize, 0, 56)
+            local curPos = camera.CFrame.Position
+            local moved = (curPos - prevCamPos).Magnitude
+            local target = math.clamp(moved * cfg.blurSize, 0, 56)
             blurEffect.Size = blurEffect.Size + (target - blurEffect.Size) * 0.3
             prevCamPos = curPos
         end)
     else
-        if blurConn then blurConn:Disconnect(); blurConn=nil end
-        if blurEffect then blurEffect:Destroy(); blurEffect=nil end
+        if blurConn then blurConn:Disconnect(); blurConn = nil end
+        if blurEffect then blurEffect:Destroy(); blurEffect = nil end
     end
 end
 
-local featureBinds = {}
+-- ================================================================
+-- RESTART features after respawn
+-- ================================================================
+local function restartFeature(key)
+    local f = features[key]
+    if f.conn then f.conn:Disconnect(); f.conn = nil end
+    if     key == "PixelSurf"  then makeSurf(key, Vector3.new(0,0,0),   function() return cfg.pixelMaxSpeed   end)
+    elseif key == "TextureBug" then makeSurf(key, Vector3.new(0,2.5,0), function() return cfg.textureMaxSpeed end)
+    elseif key == "AutoBhop"   then bhop_start()
+    elseif key == "EdgeBug"    then edgebug_start()
+    elseif key == "JumpBug"    then jumpbug_start()
+    elseif key == "LongJump"   then longjump_start()
+    elseif key == "MiniJump"   then minijump_start()
+    elseif key == "FakeAimbot" then fakeaimbot_start()
+    end
+end
+
+player.CharacterAdded:Connect(function(char)
+    bindCharacter(char)
+    task.wait(0.5)
+    for key, f in pairs(features) do
+        if f.enabled then restartFeature(key) end
+    end
+    if espEnabled then refreshESP() end
+end)
 
 -- ================================================================
--- INDICATORS
+-- UI – Clarity style (dark, green accent)
 -- ================================================================
-local INDICATOR_TAGS = {
-    PixelSurf  = "ps",
-    TextureBug = "tb",
-    LongJump   = "lj",
-    MiniJump   = "mj",
-    JumpBug    = "jb",
-    AutoBhop   = "bh",
-    EdgeBug    = "eb",
-    FakeAimbot = "amb",
+
+local G = {
+    BG        = Color3.fromRGB(13, 13, 15),
+    SIDEBAR   = Color3.fromRGB(10, 10, 12),
+    PANEL     = Color3.fromRGB(18, 18, 22),
+    DIV       = Color3.fromRGB(30, 30, 38),
+    ROW_HVR   = Color3.fromRGB(20, 20, 26),
+    GREEN     = Color3.fromRGB(76, 210, 96),
+    GREEN_DIM = Color3.fromRGB(30,  80,  40),
+    WHITE     = Color3.fromRGB(230, 230, 230),
+    DIM       = Color3.fromRGB(90,  90, 105),
+    MUTE      = Color3.fromRGB(45,  45,  55),
+    CB_OFF    = Color3.fromRGB(25,  25,  32),
+    TRACK_BG  = Color3.fromRGB(32,  32,  42),
 }
+
+local WIN_W, WIN_H = 500, 580
+local SB_W = 118
+local TW   = 110  -- slider track width
+
+local featureBinds    = {}
 local indicatorLabels = {}
 
-local function refreshIndicators()
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "DwbiMenu"; screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+screenGui.DisplayOrder = 9999; screenGui.IgnoreGuiInset = true
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+-- Watermark
+local wmFrame = Instance.new("Frame")
+wmFrame.Size = UDim2.new(0,0,0,22); wmFrame.AutomaticSize = Enum.AutomaticSize.X
+wmFrame.Position = UDim2.new(1,0,0,8); wmFrame.AnchorPoint = Vector2.new(1,0)
+wmFrame.BackgroundColor3 = G.SIDEBAR; wmFrame.BorderSizePixel = 0; wmFrame.ZIndex = 10
+wmFrame.Parent = screenGui
+Instance.new("UICorner", wmFrame).CornerRadius = UDim.new(0,4)
+local wmStroke = Instance.new("UIStroke", wmFrame); wmStroke.Color = G.DIV; wmStroke.Thickness = 1
+local wmPad = Instance.new("UIPadding", wmFrame)
+wmPad.PaddingLeft = UDim.new(0,8); wmPad.PaddingRight = UDim.new(0,8)
+
+local wmLayout = Instance.new("UIListLayout", wmFrame)
+wmLayout.FillDirection = Enum.FillDirection.Horizontal
+wmLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+wmLayout.Padding = UDim.new(0,0)
+
+local function wmPart(txt, col)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(0,0,1,0); l.AutomaticSize = Enum.AutomaticSize.X
+    l.BackgroundTransparency = 1; l.Text = txt
+    l.TextColor3 = col; l.Font = Enum.Font.GothamMedium; l.TextSize = 11; l.ZIndex = 11
+    l.Parent = wmFrame
+    return l
+end
+
+local wmName  = wmPart("dwbi", G.GREEN)
+local wmSep1  = wmPart(" | ", G.MUTE)
+local wmUser  = wmPart(player.Name, G.WHITE)
+local wmSep2  = wmPart(" | ", G.MUTE)
+local wmFps   = wmPart("0 fps", G.DIM)
+
+local fpsCounter = 0
+RunService.RenderStepped:Connect(function(dt)
+    fpsCounter = fpsCounter + 1
+    if fpsCounter >= 10 then
+        fpsCounter = 0
+        local fps = math.floor(1 / math.max(dt, 0.001) + 0.5)
+        wmFps.Text = fps.." fps"
+    end
+end)
+
+-- Indicator bar
+local indBar = Instance.new("Frame")
+indBar.Size = UDim2.new(0,0,0,22); indBar.AutomaticSize = Enum.AutomaticSize.X
+indBar.Position = UDim2.new(0.5,0,1,-10); indBar.AnchorPoint = Vector2.new(0.5,1)
+indBar.BackgroundColor3 = G.SIDEBAR; indBar.BorderSizePixel = 0; indBar.ZIndex = 10
+indBar.Parent = screenGui
+Instance.new("UICorner", indBar).CornerRadius = UDim.new(0,4)
+local ibStroke = Instance.new("UIStroke", indBar); ibStroke.Color = G.DIV; ibStroke.Thickness = 1
+local ibLayout = Instance.new("UIListLayout", indBar)
+ibLayout.FillDirection = Enum.FillDirection.Horizontal
+ibLayout.Padding = UDim.new(0,6)
+local ibPad = Instance.new("UIPadding", indBar)
+ibPad.PaddingLeft = UDim.new(0,8); ibPad.PaddingRight = UDim.new(0,8)
+ibPad.PaddingTop = UDim.new(0,3); ibPad.PaddingBottom = UDim.new(0,3)
+
+local IND_ORDER = {"ps","tb","lj","mj","jb","bh","eb","amb"}
+local IND_MAP   = {ps="PixelSurf",tb="TextureBug",lj="LongJump",
+                   mj="MiniJump",jb="JumpBug",bh="AutoBhop",
+                   eb="EdgeBug",amb="FakeAimbot"}
+for i,tag in ipairs(IND_ORDER) do
+    local key = IND_MAP[tag]
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(0,0,1,0); l.AutomaticSize = Enum.AutomaticSize.X
+    l.BackgroundTransparency = 1; l.Text = tag
+    l.TextColor3 = G.MUTE; l.Font = Enum.Font.GothamMedium; l.TextSize = 11
+    l.LayoutOrder = i; l.ZIndex = 11; l.Parent = indBar
+    indicatorLabels[key] = l
+end
+
+refreshIndicators = function()
     for key, lbl in pairs(indicatorLabels) do
-        local f = features[key]
-        if not f then continue end
+        local f = features[key]; if not f then continue end
         if not f.enabled then
-            lbl.TextColor3 = Color3.fromRGB(55,55,55)
-        elseif (key=="PixelSurf" or key=="TextureBug") and f.surfing then
-            lbl.TextColor3 = Color3.fromRGB(79,200,90)
+            lbl.TextColor3 = G.MUTE
+        elseif (key == "PixelSurf" or key == "TextureBug") and f.surfing then
+            lbl.TextColor3 = G.GREEN
         else
-            lbl.TextColor3 = Color3.new(1,1,1)
+            lbl.TextColor3 = G.WHITE
         end
     end
 end
-
 RunService.Heartbeat:Connect(refreshIndicators)
 
--- ================================================================
--- UI
--- ================================================================
-local BG        = Color3.fromRGB(12,  12,  12)
-local SIDEBAR   = Color3.fromRGB(8,   8,   8)
-local DIVIDER   = Color3.fromRGB(35,  35,  35)
-local ROW_HOVER = Color3.fromRGB(22,  22,  22)
-local TEXT_SEC  = Color3.fromRGB(130, 130, 130)
-local TEXT_DIM  = Color3.fromRGB(60,  60,  60)
-local WHITE     = Color3.fromRGB(255, 255, 255)
-local CHECK_OFF = Color3.fromRGB(30,  30,  30)
+-- Main window
+local win = Instance.new("Frame")
+win.Name = "Window"; win.Size = UDim2.new(0, WIN_W, 0, WIN_H)
+win.Position = UDim2.new(0.5, -WIN_W/2, 0.5, -WIN_H/2)
+win.BackgroundColor3 = G.BG; win.BorderSizePixel = 0
+win.ZIndex = 1; win.Visible = false; win.Parent = screenGui
+Instance.new("UICorner", win).CornerRadius = UDim.new(0,6)
+local winStroke = Instance.new("UIStroke", win); winStroke.Color = G.DIV; winStroke.Thickness = 1
 
-local W, H   = 480, 540
-local SIDE_W = 120
-local TRACK_W = 110
+-- Title bar
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1,0,0,30); titleBar.BackgroundColor3 = G.SIDEBAR
+titleBar.BorderSizePixel = 0; titleBar.ZIndex = 2; titleBar.Parent = win
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0,6)
+local tbFill = Instance.new("Frame", titleBar)
+tbFill.Size = UDim2.new(1,0,0,8); tbFill.Position = UDim2.new(0,0,1,-8)
+tbFill.BackgroundColor3 = G.SIDEBAR; tbFill.BorderSizePixel = 0; tbFill.ZIndex = 2
+local tbBorder = Instance.new("Frame", titleBar)
+tbBorder.Size = UDim2.new(1,0,0,1); tbBorder.Position = UDim2.new(0,0,1,0)
+tbBorder.BackgroundColor3 = G.DIV; tbBorder.BorderSizePixel = 0; tbBorder.ZIndex = 3
 
-local screenGui=Instance.new("ScreenGui")
-screenGui.Name="DwbiMenu"; screenGui.ResetOnSpawn=false
-screenGui.ZIndexBehavior=Enum.ZIndexBehavior.Global
-screenGui.DisplayOrder=9999
-screenGui.IgnoreGuiInset=true
-screenGui.Parent=player:WaitForChild("PlayerGui")
+local tbLeft = Instance.new("Frame", titleBar)
+tbLeft.Size = UDim2.new(1,-40,1,0); tbLeft.Position = UDim2.new(0,12,0,0)
+tbLeft.BackgroundTransparency = 1; tbLeft.ZIndex = 3
+local tbLL = Instance.new("UIListLayout", tbLeft)
+tbLL.FillDirection = Enum.FillDirection.Horizontal
+tbLL.VerticalAlignment = Enum.VerticalAlignment.Center
+tbLL.Padding = UDim.new(0,0)
+local tbA = Instance.new("TextLabel", tbLeft)
+tbA.Size = UDim2.new(0,0,1,0); tbA.AutomaticSize = Enum.AutomaticSize.X
+tbA.BackgroundTransparency = 1; tbA.Text = "dwbi"
+tbA.TextColor3 = G.GREEN; tbA.Font = Enum.Font.GothamMedium; tbA.TextSize = 12; tbA.ZIndex = 3
+local tbB = Instance.new("TextLabel", tbLeft)
+tbB.Size = UDim2.new(0,0,1,0); tbB.AutomaticSize = Enum.AutomaticSize.X
+tbB.BackgroundTransparency = 1; tbB.Text = " movement"
+tbB.TextColor3 = G.MUTE; tbB.Font = Enum.Font.GothamMedium; tbB.TextSize = 11; tbB.ZIndex = 3
 
--- Watermark
-local watermark=Instance.new("Frame")
-watermark.Size=UDim2.new(0,52,0,22)
-watermark.Position=UDim2.new(1,-6,0,6)
-watermark.AnchorPoint=Vector2.new(1,0)
-watermark.BackgroundColor3=Color3.fromRGB(0,0,0)
-watermark.BorderSizePixel=0
-watermark.ZIndex=10
-watermark.Parent=screenGui
-Instance.new("UICorner",watermark).CornerRadius=UDim.new(0,4)
+local closeBtn = Instance.new("TextButton", titleBar)
+closeBtn.Size = UDim2.new(0,30,1,0); closeBtn.Position = UDim2.new(1,-30,0,0)
+closeBtn.BackgroundTransparency = 1; closeBtn.Text = "x"
+closeBtn.TextColor3 = G.DIM; closeBtn.Font = Enum.Font.GothamMedium; closeBtn.TextSize = 16; closeBtn.ZIndex = 3
+closeBtn.MouseEnter:Connect(function() closeBtn.TextColor3 = G.WHITE end)
+closeBtn.MouseLeave:Connect(function() closeBtn.TextColor3 = G.DIM end)
+closeBtn.MouseButton1Click:Connect(function() win.Visible = false end)
 
-local wmStroke=Instance.new("UIStroke",watermark)
-wmStroke.Color=Color3.fromRGB(50,50,50)
-wmStroke.Thickness=1
-
-local wmLabel=Instance.new("TextLabel")
-wmLabel.Size=UDim2.new(1,0,1,0)
-wmLabel.BackgroundTransparency=1
-wmLabel.Text="dwbi"
-wmLabel.TextColor3=Color3.new(1,1,1)
-wmLabel.Font=Enum.Font.Code
-wmLabel.TextSize=12
-wmLabel.ZIndex=11
-wmLabel.Parent=watermark
-
--- Indicator bar
-local indicatorBar=Instance.new("Frame")
-indicatorBar.Size=UDim2.new(0,0,0,22)
-indicatorBar.Position=UDim2.new(0.5,0,1,-10)
-indicatorBar.AnchorPoint=Vector2.new(0.5,1)
-indicatorBar.BackgroundTransparency=1
-indicatorBar.BorderSizePixel=0
-indicatorBar.AutomaticSize=Enum.AutomaticSize.X
-indicatorBar.ZIndex=10
-indicatorBar.Parent=screenGui
-
-local ibLayout=Instance.new("UIListLayout",indicatorBar)
-ibLayout.FillDirection=Enum.FillDirection.Horizontal
-ibLayout.Padding=UDim.new(0,4)
-ibLayout.SortOrder=Enum.SortOrder.LayoutOrder
-
-local ibPad=Instance.new("UIPadding",indicatorBar)
-ibPad.PaddingLeft=UDim.new(0,6); ibPad.PaddingRight=UDim.new(0,6)
-ibPad.PaddingTop=UDim.new(0,2); ibPad.PaddingBottom=UDim.new(0,2)
-
-local INDICATOR_ORDER = {"ps","tb","lj","mj","jb","bh","eb","amb"}
-local INDICATOR_KEY_MAP = {
-    ps="PixelSurf", tb="TextureBug", lj="LongJump",
-    mj="MiniJump",  jb="JumpBug",   bh="AutoBhop",
-    eb="EdgeBug",   amb="FakeAimbot"
-}
-
-for i, tag in ipairs(INDICATOR_ORDER) do
-    local key = INDICATOR_KEY_MAP[tag]
-    local lbl=Instance.new("TextLabel")
-    lbl.Size=UDim2.new(0,0,1,0)
-    lbl.AutomaticSize=Enum.AutomaticSize.X
-    lbl.BackgroundTransparency=1
-    lbl.Text=tag
-    lbl.TextColor3=Color3.fromRGB(60,60,60)
-    lbl.Font=Enum.Font.GothamBold
-    lbl.TextSize=13
-    lbl.LayoutOrder=i
-    lbl.ZIndex=11
-    lbl.Parent=indicatorBar
-    indicatorLabels[key]=lbl
-end
-
-local win=Instance.new("Frame")
-win.Name="Window"; win.Size=UDim2.new(0,W,0,H)
-win.Position=UDim2.new(0.5,-W/2,0.5,-H/2)
-win.BackgroundColor3=BG; win.BorderSizePixel=0
-win.ZIndex=1; win.Visible=false; win.Parent=screenGui
-Instance.new("UICorner",win).CornerRadius=UDim.new(0,5)
-local winStroke=Instance.new("UIStroke",win)
-winStroke.Color=DIVIDER; winStroke.Thickness=1
-
-local titleBar=Instance.new("Frame")
-titleBar.Size=UDim2.new(1,0,0,28); titleBar.BackgroundColor3=SIDEBAR
-titleBar.BorderSizePixel=0; titleBar.ZIndex=2; titleBar.Parent=win
-Instance.new("UICorner",titleBar).CornerRadius=UDim.new(0,5)
-local tbPatch=Instance.new("Frame")
-tbPatch.Size=UDim2.new(1,0,0,6); tbPatch.Position=UDim2.new(0,0,1,-6)
-tbPatch.BackgroundColor3=SIDEBAR; tbPatch.BorderSizePixel=0; tbPatch.ZIndex=2; tbPatch.Parent=titleBar
-local titleBorder=Instance.new("Frame")
-titleBorder.Size=UDim2.new(1,0,0,1); titleBorder.Position=UDim2.new(0,0,1,0)
-titleBorder.BackgroundColor3=DIVIDER; titleBorder.BorderSizePixel=0; titleBorder.ZIndex=3; titleBorder.Parent=titleBar
-
-local titleLbl=Instance.new("TextLabel")
-titleLbl.Size=UDim2.new(1,-40,1,0); titleLbl.Position=UDim2.new(0,12,0,0)
-titleLbl.BackgroundTransparency=1; titleLbl.Text="dwbi"
-titleLbl.TextColor3=WHITE; titleLbl.Font=Enum.Font.Code; titleLbl.TextSize=12
-titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.ZIndex=3; titleLbl.Parent=titleBar
-
-local subLbl=Instance.new("TextLabel")
-subLbl.Size=UDim2.new(0,80,1,0); subLbl.Position=UDim2.new(0,38,0,0)
-subLbl.BackgroundTransparency=1; subLbl.Text="movement"
-subLbl.TextColor3=TEXT_DIM; subLbl.Font=Enum.Font.Code; subLbl.TextSize=11
-subLbl.TextXAlignment=Enum.TextXAlignment.Left; subLbl.ZIndex=3; subLbl.Parent=titleBar
-
-local closeBtn=Instance.new("TextButton")
-closeBtn.Size=UDim2.new(0,28,1,0); closeBtn.Position=UDim2.new(1,-28,0,0)
-closeBtn.BackgroundTransparency=1; closeBtn.Text="×"
-closeBtn.TextColor3=TEXT_DIM; closeBtn.Font=Enum.Font.Code; closeBtn.TextSize=16
-closeBtn.ZIndex=3; closeBtn.Parent=titleBar
-closeBtn.MouseEnter:Connect(function() closeBtn.TextColor3=WHITE end)
-closeBtn.MouseLeave:Connect(function() closeBtn.TextColor3=TEXT_DIM end)
-closeBtn.MouseButton1Click:Connect(function() win.Visible=false end)
-
-local dragging,dragStart,dragOrigin=false,nil,nil
+-- Drag
+local dragging, dragStart, dragOrigin = false, nil, nil
 titleBar.InputBegan:Connect(function(i)
-    if i.UserInputType==Enum.UserInputType.MouseButton1 then
-        dragging=true; dragStart=i.Position; dragOrigin=win.Position
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true; dragStart = i.Position; dragOrigin = win.Position
     end
 end)
 titleBar.InputEnded:Connect(function(i)
-    if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
 end)
 UserInputService.InputChanged:Connect(function(i)
-    if dragging and i.UserInputType==Enum.UserInputType.MouseMovement then
-        local d=i.Position-dragStart
-        win.Position=UDim2.new(dragOrigin.X.Scale,dragOrigin.X.Offset+d.X,
-                               dragOrigin.Y.Scale,dragOrigin.Y.Offset+d.Y)
+    if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+        local d = i.Position - dragStart
+        win.Position = UDim2.new(dragOrigin.X.Scale, dragOrigin.X.Offset + d.X,
+                                 dragOrigin.Y.Scale, dragOrigin.Y.Offset + d.Y)
     end
 end)
 
-local body=Instance.new("Frame")
-body.Size=UDim2.new(1,0,1,-28); body.Position=UDim2.new(0,0,0,28)
-body.BackgroundTransparency=1; body.ZIndex=2; body.Parent=win
+-- Body
+local body = Instance.new("Frame", win)
+body.Size = UDim2.new(1,0,1,-30); body.Position = UDim2.new(0,0,0,30)
+body.BackgroundTransparency = 1; body.ZIndex = 2
 
-local sidebar=Instance.new("Frame")
-sidebar.Size=UDim2.new(0,SIDE_W,1,0); sidebar.BackgroundColor3=SIDEBAR
-sidebar.BorderSizePixel=0; sidebar.ZIndex=2; sidebar.Parent=body
-Instance.new("UICorner",sidebar).CornerRadius=UDim.new(0,5)
-local sbPatchTop=Instance.new("Frame")
-sbPatchTop.Size=UDim2.new(1,0,0,6); sbPatchTop.BackgroundColor3=SIDEBAR
-sbPatchTop.BorderSizePixel=0; sbPatchTop.ZIndex=2; sbPatchTop.Parent=sidebar
-local sbPatchRight=Instance.new("Frame")
-sbPatchRight.Size=UDim2.new(0,6,1,0); sbPatchRight.Position=UDim2.new(1,-6,0,0)
-sbPatchRight.BackgroundColor3=SIDEBAR; sbPatchRight.BorderSizePixel=0
-sbPatchRight.ZIndex=2; sbPatchRight.Parent=sidebar
-local sbBorder=Instance.new("Frame")
-sbBorder.Size=UDim2.new(0,1,1,0); sbBorder.Position=UDim2.new(1,-1,0,0)
-sbBorder.BackgroundColor3=DIVIDER; sbBorder.BorderSizePixel=0
-sbBorder.ZIndex=3; sbBorder.Parent=sidebar
+-- Sidebar
+local sidebar = Instance.new("Frame", body)
+sidebar.Size = UDim2.new(0, SB_W, 1, 0)
+sidebar.BackgroundColor3 = G.SIDEBAR; sidebar.BorderSizePixel = 0; sidebar.ZIndex = 2
+Instance.new("UICorner", sidebar).CornerRadius = UDim.new(0,6)
+local sbPT = Instance.new("Frame", sidebar)
+sbPT.Size = UDim2.new(1,0,0,8); sbPT.BackgroundColor3 = G.SIDEBAR; sbPT.BorderSizePixel = 0; sbPT.ZIndex = 2
+local sbPR = Instance.new("Frame", sidebar)
+sbPR.Size = UDim2.new(0,8,1,0); sbPR.Position = UDim2.new(1,-8,0,0)
+sbPR.BackgroundColor3 = G.SIDEBAR; sbPR.BorderSizePixel = 0; sbPR.ZIndex = 2
+local sbBord = Instance.new("Frame", sidebar)
+sbBord.Size = UDim2.new(0,1,1,0); sbBord.Position = UDim2.new(1,-1,0,0)
+sbBord.BackgroundColor3 = G.DIV; sbBord.BorderSizePixel = 0; sbBord.ZIndex = 3
 
-Instance.new("UIListLayout",sidebar).Padding=UDim.new(0,0)
-local sbPad=Instance.new("UIPadding"); sbPad.PaddingTop=UDim.new(0,10); sbPad.Parent=sidebar
+local function makeSbLabel(txt, yPos)
+    local f = Instance.new("Frame", sidebar)
+    f.Size = UDim2.new(1,-1,0,18); f.Position = UDim2.new(0,0,0,yPos)
+    f.BackgroundTransparency = 1; f.ZIndex = 3
+    local l = Instance.new("TextLabel", f)
+    l.Size = UDim2.new(1,-8,1,0); l.Position = UDim2.new(0,8,0,0)
+    l.BackgroundTransparency = 1; l.Text = txt
+    l.TextColor3 = G.MUTE; l.Font = Enum.Font.GothamMedium; l.TextSize = 8
+    l.TextXAlignment = Enum.TextXAlignment.Left; l.ZIndex = 4
+end
 
+local TAB_DEFS = {
+    {id="movement", label="movement", icon="", y=18},
+    {id="visuals",  label="visuals",  icon="", y=50},
+}
 local activeTab = "movement"
+local navTabs = {}
+local contentPanels = {}
 
-local function makeNavTab(labelTxt, isActive)
-    local btn=Instance.new("TextButton")
-    btn.Size=UDim2.new(1,-1,0,26); btn.BackgroundColor3=isActive and Color3.fromRGB(22,22,22) or SIDEBAR
-    btn.BorderSizePixel=0; btn.Text=""; btn.AutoButtonColor=false
-    btn.ZIndex=3; btn.Parent=sidebar
+local function makeNavTab(def)
+    local isActive = (def.id == activeTab)
+    local btn = Instance.new("TextButton", sidebar)
+    btn.Size = UDim2.new(1,-1,0,28); btn.Position = UDim2.new(0,0,0,def.y)
+    btn.BackgroundColor3 = isActive and G.PANEL or G.SIDEBAR
+    btn.BorderSizePixel = 0; btn.Text = ""; btn.AutoButtonColor = false; btn.ZIndex = 3
 
-    local accent=Instance.new("Frame")
-    accent.Size=UDim2.new(0,2,0.6,0); accent.Position=UDim2.new(0,0,0.2,0)
-    accent.BackgroundColor3=WHITE; accent.BorderSizePixel=0; accent.ZIndex=4
-    accent.Visible=isActive; accent.Parent=btn
+    local accent = Instance.new("Frame", btn)
+    accent.Size = UDim2.new(0,2,0.6,0); accent.Position = UDim2.new(0,0,0.2,0)
+    accent.BackgroundColor3 = G.GREEN; accent.BorderSizePixel = 0; accent.ZIndex = 4
+    accent.Visible = isActive
 
-    local lbl=Instance.new("TextLabel")
-    lbl.Size=UDim2.new(1,-12,1,0); lbl.Position=UDim2.new(0,10,0,0)
-    lbl.BackgroundTransparency=1; lbl.Text=labelTxt
-    lbl.TextColor3=isActive and WHITE or TEXT_SEC
-    lbl.Font=Enum.Font.Code; lbl.TextSize=11
-    lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.ZIndex=4; lbl.Parent=btn
+    local lbl = Instance.new("TextLabel", btn)
+    lbl.Size = UDim2.new(1,-12,1,0); lbl.Position = UDim2.new(0,10,0,0)
+    lbl.BackgroundTransparency = 1; lbl.Text = def.label
+    lbl.TextColor3 = isActive and G.WHITE or G.DIM
+    lbl.Font = Enum.Font.GothamMedium; lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.ZIndex = 4
 
-    return btn, accent, lbl
+    navTabs[def.id] = {btn=btn,accent=accent,lbl=lbl}
+    return btn
 end
 
-local movBtn, movAccent, movLbl = makeNavTab("movement", true)
-local visBtn, visAccent, visLbl = makeNavTab("visuals",  false)
+makeSbLabel("TABS", 4)
+for _, def in ipairs(TAB_DEFS) do makeNavTab(def) end
 
-local function makeContentPanel(visible)
-    local panel=Instance.new("ScrollingFrame")
-    panel.Size=UDim2.new(1,-SIDE_W,1,0); panel.Position=UDim2.new(0,SIDE_W,0,0)
-    panel.BackgroundTransparency=1; panel.BorderSizePixel=0
-    panel.ScrollBarThickness=3; panel.ScrollBarImageColor3=DIVIDER
-    panel.CanvasSize=UDim2.new(0,0,0,0); panel.AutomaticCanvasSize=Enum.AutomaticSize.Y
-    panel.ZIndex=2; panel.Visible=visible; panel.Parent=body
-    local list=Instance.new("UIListLayout")
-    list.Padding=UDim.new(0,0); list.SortOrder=Enum.SortOrder.LayoutOrder; list.Parent=panel
-    local pad=Instance.new("UIPadding")
-    pad.PaddingTop=UDim.new(0,6); pad.PaddingBottom=UDim.new(0,6)
-    pad.PaddingLeft=UDim.new(0,14); pad.PaddingRight=UDim.new(0,14); pad.Parent=panel
-    return panel
+-- Content panels
+local function makePanel(visible)
+    local p = Instance.new("ScrollingFrame", body)
+    p.Size = UDim2.new(1,-SB_W,1,0); p.Position = UDim2.new(0,SB_W,0,0)
+    p.BackgroundTransparency = 1; p.BorderSizePixel = 0
+    p.ScrollBarThickness = 3; p.ScrollBarImageColor3 = G.DIV
+    p.CanvasSize = UDim2.new(0,0,0,0); p.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    p.ZIndex = 2; p.Visible = visible
+    local list = Instance.new("UIListLayout", p)
+    list.Padding = UDim.new(0,0); list.SortOrder = Enum.SortOrder.LayoutOrder
+    local pad = Instance.new("UIPadding", p)
+    pad.PaddingTop = UDim.new(0,8); pad.PaddingBottom = UDim.new(0,10)
+    pad.PaddingLeft = UDim.new(0,10); pad.PaddingRight = UDim.new(0,10)
+    return p
 end
 
-local content     = makeContentPanel(true)
-local visContent  = makeContentPanel(false)
+local movPanel = makePanel(true)
+local visPanel = makePanel(false)
+contentPanels["movement"] = movPanel
+contentPanels["visuals"] = visPanel
 
 local function switchTab(tab)
-    activeTab       = tab
-    content.Visible    = tab=="movement"
-    visContent.Visible = tab=="visuals"
-
-    movBtn.BackgroundColor3  = tab=="movement" and Color3.fromRGB(22,22,22) or SIDEBAR
-    movAccent.Visible        = tab=="movement"
-    movLbl.TextColor3        = tab=="movement" and WHITE or TEXT_SEC
-
-    visBtn.BackgroundColor3  = tab=="visuals" and Color3.fromRGB(22,22,22) or SIDEBAR
-    visAccent.Visible        = tab=="visuals"
-    visLbl.TextColor3        = tab=="visuals" and WHITE or TEXT_SEC
+    activeTab = tab
+    for id, p in pairs(contentPanels) do p.Visible = (id == tab) end
+    for id, t in pairs(navTabs) do
+        local act = (id == tab)
+        t.btn.BackgroundColor3 = act and G.PANEL or G.SIDEBAR
+        t.accent.Visible = act
+        t.lbl.TextColor3 = act and G.WHITE or G.DIM
+    end
 end
 
-movBtn.MouseButton1Click:Connect(function() switchTab("movement") end)
-visBtn.MouseButton1Click:Connect(function() switchTab("visuals") end)
+for _, def in ipairs(TAB_DEFS) do
+    navTabs[def.id].btn.MouseButton1Click:Connect(function() switchTab(def.id) end)
+end
 
-local function makeRow(feat)
-    local hasSlider = feat.minVal ~= nil
-    local rowH = hasSlider and 50 or 32
+-- Section header
+local function makeSectionHeader(parent, txt)
+    local wrap = Instance.new("Frame", parent)
+    wrap.Size = UDim2.new(1,0,0,24); wrap.BackgroundTransparency = 1
+    wrap.BorderSizePixel = 0; wrap.ZIndex = 3
+    local lbl = Instance.new("TextLabel", wrap)
+    lbl.Size = UDim2.new(1,0,0,16); lbl.Position = UDim2.new(0,0,0,6)
+    lbl.BackgroundTransparency = 1; lbl.Text = txt
+    lbl.TextColor3 = G.GREEN; lbl.Font = Enum.Font.GothamMedium; lbl.TextSize = 9
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.ZIndex = 4
+    local div = Instance.new("Frame", wrap)
+    div.Size = UDim2.new(1,0,0,1); div.Position = UDim2.new(0,0,1,-1)
+    div.BackgroundColor3 = G.DIV; div.BorderSizePixel = 0; div.ZIndex = 4
+end
 
-    local wrap=Instance.new("Frame")
-    wrap.Size=UDim2.new(1,0,0,rowH); wrap.BackgroundColor3=BG
-    wrap.BorderSizePixel=0; wrap.ZIndex=3; wrap.Parent=content
+-- Slider builder
+local function buildSlider(parent, xOff, yOff, labelTxt, minV, maxV, initV, trackW, onCh)
+    local row = Instance.new("Frame", parent)
+    row.Size = UDim2.new(1,-xOff,0,14); row.Position = UDim2.new(0,xOff,0,yOff)
+    row.BackgroundTransparency = 1; row.ZIndex = 6
 
-    local rowDiv=Instance.new("Frame")
-    rowDiv.Size=UDim2.new(1,0,0,1); rowDiv.Position=UDim2.new(0,0,1,-1)
-    rowDiv.BackgroundColor3=DIVIDER; rowDiv.BorderSizePixel=0; rowDiv.ZIndex=4; rowDiv.Parent=wrap
+    local sLbl = Instance.new("TextLabel", row)
+    sLbl.Size = UDim2.new(0,34,1,0); sLbl.BackgroundTransparency = 1; sLbl.Text = labelTxt
+    sLbl.TextColor3 = G.MUTE; sLbl.Font = Enum.Font.GothamMedium; sLbl.TextSize = 9
+    sLbl.TextXAlignment = Enum.TextXAlignment.Left; sLbl.ZIndex = 7
 
-    local cb=Instance.new("Frame")
-    cb.Size=UDim2.new(0,10,0,10); cb.Position=UDim2.new(0,0,0,10)
-    cb.BackgroundColor3=CHECK_OFF; cb.BorderSizePixel=0; cb.ZIndex=4; cb.Parent=wrap
-    Instance.new("UICorner",cb).CornerRadius=UDim.new(0,2)
-    local cbStroke=Instance.new("UIStroke",cb)
-    cbStroke.Color=DIVIDER; cbStroke.Thickness=1
+    local track = Instance.new("Frame", row)
+    track.Size = UDim2.new(0, trackW, 0, 2); track.Position = UDim2.new(0,36,0.5,-1)
+    track.BackgroundColor3 = G.TRACK_BG; track.BorderSizePixel = 0; track.ZIndex = 7
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1,0)
 
-    local lbl=Instance.new("TextLabel")
-    lbl.Size=UDim2.new(1,-80,0,20); lbl.Position=UDim2.new(0,16,0,4)
-    lbl.BackgroundTransparency=1; lbl.Text=feat.label
-    lbl.TextColor3=TEXT_SEC; lbl.Font=Enum.Font.Code; lbl.TextSize=12
-    lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.ZIndex=4; lbl.Parent=wrap
+    local frac = math.clamp((initV - minV) / (maxV - minV), 0, 1)
+    local fill = Instance.new("Frame", track)
+    fill.Size = UDim2.new(frac, 0, 1, 0); fill.BackgroundColor3 = G.GREEN
+    fill.BorderSizePixel = 0; fill.ZIndex = 8
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1,0)
+
+    local knob = Instance.new("Frame", track)
+    knob.Size = UDim2.new(0,8,0,8); knob.AnchorPoint = Vector2.new(0.5,0.5)
+    knob.Position = UDim2.new(frac,0,0.5,0); knob.BackgroundColor3 = G.WHITE
+    knob.BorderSizePixel = 0; knob.ZIndex = 9
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1,0)
+
+    local valLbl = Instance.new("TextLabel", row)
+    valLbl.Size = UDim2.new(0,32,1,0); valLbl.Position = UDim2.new(0, trackW + 40, 0, 0)
+    valLbl.BackgroundTransparency = 1; valLbl.Text = tostring(initV)
+    valLbl.TextColor3 = G.WHITE; valLbl.Font = Enum.Font.GothamMedium; valLbl.TextSize = 9
+    valLbl.TextXAlignment = Enum.TextXAlignment.Left; valLbl.ZIndex = 7
+
+    local sd = false
+    local function apply(ax)
+        local t = math.clamp((ax - track.AbsolutePosition.X) / trackW, 0, 1)
+        local v = math.floor(minV + t * (maxV - minV) + 0.5)
+        local f2 = (v - minV) / (maxV - minV)
+        fill.Size = UDim2.new(f2, 0, 1, 0); knob.Position = UDim2.new(f2, 0, 0.5, 0)
+        valLbl.Text = tostring(v); onCh(v)
+    end
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then sd = true; apply(i.Position.X) end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then sd = false end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if sd and i.UserInputType == Enum.UserInputType.MouseMovement then apply(i.Position.X) end
+    end)
+end
+
+-- Row builder for single‑slider features
+local function makeRow(feat, parent)
+    local hasSlider = (feat.minVal ~= nil)
+    local ROW_H = hasSlider and 50 or 30
+
+    local wrap = Instance.new("Frame", parent)
+    wrap.Size = UDim2.new(1,0,0,ROW_H)
+    wrap.BackgroundColor3 = G.BG; wrap.BorderSizePixel = 0; wrap.ZIndex = 3
+
+    local rowDiv = Instance.new("Frame", wrap)
+    rowDiv.Size = UDim2.new(1,0,0,1); rowDiv.Position = UDim2.new(0,0,1,-1)
+    rowDiv.BackgroundColor3 = G.DIV; rowDiv.BorderSizePixel = 0; rowDiv.ZIndex = 4
+
+    local cb = Instance.new("Frame", wrap)
+    cb.Size = UDim2.new(0,11,0,11); cb.Position = UDim2.new(0,0,0,10)
+    cb.BackgroundColor3 = G.CB_OFF; cb.BorderSizePixel = 0; cb.ZIndex = 4
+    Instance.new("UICorner", cb).CornerRadius = UDim.new(0,2)
+    local cbS = Instance.new("UIStroke", cb); cbS.Color = G.DIV; cbS.Thickness = 1
+
+    local lbl = Instance.new("TextLabel", wrap)
+    lbl.Size = UDim2.new(1,-80,0,20); lbl.Position = UDim2.new(0,16,0,5)
+    lbl.BackgroundTransparency = 1; lbl.Text = feat.label
+    lbl.TextColor3 = G.DIM; lbl.Font = Enum.Font.GothamMedium; lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.ZIndex = 4
 
     if feat.hint then
-        local hintLbl=Instance.new("TextLabel")
-        hintLbl.Size=UDim2.new(0,60,0,20); hintLbl.Position=UDim2.new(1,-62,0,4)
-        hintLbl.BackgroundTransparency=1; hintLbl.Text=feat.hint
-        hintLbl.TextColor3=TEXT_DIM; hintLbl.Font=Enum.Font.Code; hintLbl.TextSize=9
-        hintLbl.TextXAlignment=Enum.TextXAlignment.Right; hintLbl.ZIndex=4; hintLbl.Parent=wrap
+        local hint = Instance.new("TextLabel", wrap)
+        hint.Size = UDim2.new(0,60,0,20); hint.Position = UDim2.new(1,-62,0,5)
+        hint.BackgroundTransparency = 1; hint.Text = feat.hint
+        hint.TextColor3 = G.MUTE; hint.Font = Enum.Font.GothamMedium; hint.TextSize = 9
+        hint.TextXAlignment = Enum.TextXAlignment.Right; hint.ZIndex = 4
     end
 
-    local clickZone=Instance.new("TextButton")
-    clickZone.Size=UDim2.new(1,0,0,hasSlider and 26 or rowH)
-    clickZone.BackgroundTransparency=1; clickZone.Text=""
-    clickZone.ZIndex=5; clickZone.Parent=wrap
+    local cz = Instance.new("TextButton", wrap)
+    cz.Size = UDim2.new(1,0,0, hasSlider and 28 or ROW_H)
+    cz.BackgroundTransparency = 1; cz.Text = ""; cz.ZIndex = 5
 
     if hasSlider then
-        local sliderRow=Instance.new("Frame")
-        sliderRow.Size=UDim2.new(1,-16,0,14); sliderRow.Position=UDim2.new(0,16,0,28)
-        sliderRow.BackgroundTransparency=1; sliderRow.ZIndex=4; sliderRow.Parent=wrap
-
-        local spLbl=Instance.new("TextLabel")
-        spLbl.Size=UDim2.new(0,30,1,0); spLbl.BackgroundTransparency=1
-        spLbl.Text=feat.sliderLabel or "power"
-        spLbl.TextColor3=TEXT_DIM; spLbl.Font=Enum.Font.Code; spLbl.TextSize=9
-        spLbl.TextXAlignment=Enum.TextXAlignment.Left; spLbl.ZIndex=5; spLbl.Parent=sliderRow
-
-        local track=Instance.new("Frame")
-        track.Size=UDim2.new(0,TRACK_W,0,2); track.Position=UDim2.new(0,32,0.5,-1)
-        track.BackgroundColor3=DIVIDER; track.BorderSizePixel=0; track.ZIndex=5; track.Parent=sliderRow
-        Instance.new("UICorner",track).CornerRadius=UDim.new(1,0)
-
-        local initFrac=(feat.initVal-feat.minVal)/(feat.maxVal-feat.minVal)
-
-        local fill=Instance.new("Frame")
-        fill.Size=UDim2.new(initFrac,0,1,0); fill.BackgroundColor3=WHITE
-        fill.BorderSizePixel=0; fill.ZIndex=6; fill.Parent=track
-        Instance.new("UICorner",fill).CornerRadius=UDim.new(1,0)
-
-        local knob=Instance.new("Frame")
-        knob.Size=UDim2.new(0,7,0,7); knob.AnchorPoint=Vector2.new(0.5,0.5)
-        knob.Position=UDim2.new(initFrac,0,0.5,0); knob.BackgroundColor3=WHITE
-        knob.BorderSizePixel=0; knob.ZIndex=7; knob.Parent=track
-        Instance.new("UICorner",knob).CornerRadius=UDim.new(1,0)
-
-        local valLbl=Instance.new("TextLabel")
-        valLbl.Size=UDim2.new(0,30,1,0); valLbl.Position=UDim2.new(0,TRACK_W+36,0,0)
-        valLbl.BackgroundTransparency=1; valLbl.Text=tostring(feat.initVal)
-        valLbl.TextColor3=TEXT_SEC; valLbl.Font=Enum.Font.Code; valLbl.TextSize=9
-        valLbl.TextXAlignment=Enum.TextXAlignment.Left; valLbl.ZIndex=5; valLbl.Parent=sliderRow
-
-        local sDragging=false
-        local function applySlider(absX)
-            local t=math.clamp((absX-track.AbsolutePosition.X)/TRACK_W,0,1)
-            local val=math.floor(feat.minVal+t*(feat.maxVal-feat.minVal)+0.5)
-            local f=(val-feat.minVal)/(feat.maxVal-feat.minVal)
-            fill.Size=UDim2.new(f,0,1,0); knob.Position=UDim2.new(f,0,0.5,0)
-            valLbl.Text=tostring(val); feat.onChange(val)
-        end
-        track.InputBegan:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseButton1 then
-                sDragging=true; applySlider(i.Position.X)
-            end
-        end)
-        UserInputService.InputEnded:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseButton1 then sDragging=false end
-        end)
-        UserInputService.InputChanged:Connect(function(i)
-            if sDragging and i.UserInputType==Enum.UserInputType.MouseMovement then
-                applySlider(i.Position.X)
-            end
-        end)
+        buildSlider(wrap, 16, 30, feat.sliderLabel or "power",
+            feat.minVal, feat.maxVal, feat.initVal, TW, feat.onChange)
     end
 
-    local on=false
+    local on = false
     local function setOn(v)
-        on=v
+        on = v
         if v then
-            cb.BackgroundColor3=WHITE; cbStroke.Color=WHITE; lbl.TextColor3=WHITE
+            cb.BackgroundColor3 = G.GREEN; cbS.Color = G.GREEN; lbl.TextColor3 = G.WHITE
         else
-            cb.BackgroundColor3=CHECK_OFF; cbStroke.Color=DIVIDER; lbl.TextColor3=TEXT_SEC
+            cb.BackgroundColor3 = G.CB_OFF; cbS.Color = G.DIV; lbl.TextColor3 = G.DIM
         end
         toggleFeature(feat.key)
     end
-    clickZone.MouseButton1Click:Connect(function() setOn(not on) end)
-    clickZone.MouseEnter:Connect(function() wrap.BackgroundColor3=ROW_HOVER end)
-    clickZone.MouseLeave:Connect(function() wrap.BackgroundColor3=BG end)
+    cz.MouseButton1Click:Connect(function() setOn(not on) end)
+    cz.MouseEnter:Connect(function() wrap.BackgroundColor3 = G.ROW_HVR end)
+    cz.MouseLeave:Connect(function() wrap.BackgroundColor3 = G.BG end)
 
-    local ctxOpen = false
-    local ctxFrame = nil
-
+    -- Right-click context menu (bind)
+    local ctxOpen = false; local ctxFrame = nil
     local function closeCtx()
-        if ctxFrame then ctxFrame:Destroy(); ctxFrame=nil end
-        ctxOpen=false
+        if ctxFrame then ctxFrame:Destroy(); ctxFrame = nil end
+        ctxOpen = false
     end
-
     local function openCtx()
         if ctxOpen then closeCtx(); return end
-        ctxOpen=true
-
+        ctxOpen = true
         local bind = featureBinds[feat.key] or {}
-
-        ctxFrame=Instance.new("Frame")
-        ctxFrame.Size=UDim2.new(0,160,0,0)
-        ctxFrame.AutomaticSize=Enum.AutomaticSize.Y
-        ctxFrame.Position=UDim2.new(1,4,0,0)
-        ctxFrame.BackgroundColor3=Color3.fromRGB(18,18,18)
-        ctxFrame.BorderSizePixel=0
-        ctxFrame.ZIndex=20
-        ctxFrame.Parent=wrap
-        Instance.new("UICorner",ctxFrame).CornerRadius=UDim.new(0,4)
-        local cs=Instance.new("UIStroke",ctxFrame); cs.Color=DIVIDER; cs.Thickness=1
-
-        local ctxList=Instance.new("UIListLayout",ctxFrame)
-        ctxList.Padding=UDim.new(0,0); ctxList.SortOrder=Enum.SortOrder.LayoutOrder
+        ctxFrame = Instance.new("Frame", wrap)
+        ctxFrame.Size = UDim2.new(0,158,0,0); ctxFrame.AutomaticSize = Enum.AutomaticSize.Y
+        ctxFrame.Position = UDim2.new(1,4,0,0)
+        ctxFrame.BackgroundColor3 = G.PANEL; ctxFrame.BorderSizePixel = 0; ctxFrame.ZIndex = 20
+        Instance.new("UICorner", ctxFrame).CornerRadius = UDim.new(0,5)
+        local cs = Instance.new("UIStroke", ctxFrame); cs.Color = G.DIV; cs.Thickness = 1
+        local ctxList = Instance.new("UIListLayout", ctxFrame)
+        ctxList.Padding = UDim.new(0,0); ctxList.SortOrder = Enum.SortOrder.LayoutOrder
 
         local function ctxRow(txt, order, onClick)
-            local r=Instance.new("TextButton")
-            r.Size=UDim2.new(1,0,0,24); r.BackgroundColor3=Color3.fromRGB(18,18,18)
-            r.BorderSizePixel=0; r.Text=txt; r.TextColor3=TEXT_SEC
-            r.Font=Enum.Font.GothamBold; r.TextSize=10
-            r.TextXAlignment=Enum.TextXAlignment.Left
-            r.LayoutOrder=order; r.ZIndex=21; r.Parent=ctxFrame
-            local rPad=Instance.new("UIPadding",r)
-            rPad.PaddingLeft=UDim.new(0,8)
-            r.MouseEnter:Connect(function() r.BackgroundColor3=Color3.fromRGB(30,30,30); r.TextColor3=WHITE end)
-            r.MouseLeave:Connect(function() r.BackgroundColor3=Color3.fromRGB(18,18,18); r.TextColor3=TEXT_SEC end)
+            local r = Instance.new("TextButton", ctxFrame)
+            r.Size = UDim2.new(1,0,0,24); r.BackgroundColor3 = G.PANEL
+            r.BorderSizePixel = 0; r.Text = txt; r.TextColor3 = G.DIM
+            r.Font = Enum.Font.GothamMedium; r.TextSize = 10
+            r.TextXAlignment = Enum.TextXAlignment.Left
+            r.LayoutOrder = order; r.ZIndex = 21
+            local rp = Instance.new("UIPadding", r); rp.PaddingLeft = UDim.new(0,10)
+            r.MouseEnter:Connect(function() r.BackgroundColor3 = G.ROW_HVR; r.TextColor3 = G.GREEN end)
+            r.MouseLeave:Connect(function() r.BackgroundColor3 = G.PANEL; r.TextColor3 = G.DIM end)
             r.MouseButton1Click:Connect(function() onClick(); closeCtx() end)
-            return r
         end
 
-        local bindTxt = bind.keyCode
-            and "bind: "..tostring(bind.keyCode):gsub("Enum.KeyCode.","")
-            or  "set bind key"
-        ctxRow(bindTxt, 1, function()
-            local pickFrame=Instance.new("Frame")
-            pickFrame.Size=UDim2.new(0,180,0,36)
-            pickFrame.Position=UDim2.new(0.5,-90,0.5,-18)
-            pickFrame.BackgroundColor3=Color3.fromRGB(10,10,10)
-            pickFrame.BorderSizePixel=0; pickFrame.ZIndex=30
-            pickFrame.Parent=screenGui
-            Instance.new("UICorner",pickFrame).CornerRadius=UDim.new(0,5)
-            local ps2=Instance.new("UIStroke",pickFrame); ps2.Color=DIVIDER; ps2.Thickness=1
-            local pl=Instance.new("TextLabel",pickFrame)
-            pl.Size=UDim2.new(1,0,1,0); pl.BackgroundTransparency=1
-            pl.Text="press a key..."; pl.TextColor3=TEXT_SEC
-            pl.Font=Enum.Font.GothamBold; pl.TextSize=11; pl.ZIndex=31
-
-            local pconn
-            pconn=UserInputService.InputBegan:Connect(function(inp,gpe)
+        local bindName = bind.keyCode and tostring(bind.keyCode):gsub("Enum.KeyCode.","") or "none"
+        ctxRow("bind: "..bindName, 1, function()
+            local pf = Instance.new("Frame", screenGui)
+            pf.Size = UDim2.new(0,180,0,36); pf.Position = UDim2.new(0.5,-90,0.5,-18)
+            pf.BackgroundColor3 = G.PANEL; pf.BorderSizePixel = 0; pf.ZIndex = 30
+            Instance.new("UICorner", pf).CornerRadius = UDim.new(0,6)
+            local ps = Instance.new("UIStroke", pf); ps.Color = G.DIV; ps.Thickness = 1
+            local pl = Instance.new("TextLabel", pf)
+            pl.Size = UDim2.new(1,0,1,0); pl.BackgroundTransparency = 1
+            pl.Text = "press a key..."; pl.TextColor3 = G.DIM
+            pl.Font = Enum.Font.GothamMedium; pl.TextSize = 11; pl.ZIndex = 31
+            local pc
+            pc = UserInputService.InputBegan:Connect(function(inp, gpe)
                 if gpe then return end
-                if inp.UserInputType==Enum.UserInputType.Keyboard then
-                    if not featureBinds[feat.key] then featureBinds[feat.key]={} end
-                    featureBinds[feat.key].keyCode=inp.KeyCode
-                    pickFrame:Destroy()
-                    if pconn then pconn:Disconnect() end
+                if inp.UserInputType == Enum.UserInputType.Keyboard then
+                    if not featureBinds[feat.key] then featureBinds[feat.key] = {} end
+                    featureBinds[feat.key].keyCode = inp.KeyCode
+                    pf:Destroy()
+                    if pc then pc:Disconnect() end
                 end
             end)
         end)
 
-        local holdTxt = (bind.holdMode) and "mode: hold ✓" or "mode: hold"
+        local holdTxt = (bind.holdMode and "mode: hold [on]" or "mode: hold [off]")
         ctxRow(holdTxt, 2, function()
-            if not featureBinds[feat.key] then featureBinds[feat.key]={} end
-            local b=featureBinds[feat.key]
+            if not featureBinds[feat.key] then featureBinds[feat.key] = {} end
+            local b = featureBinds[feat.key]
             b.holdMode = not b.holdMode
-            if b.holdMode then
-                if b.keyCode then
-                    if b.holdConn then b.holdConn:Disconnect() end
-                    b.holdConn=UserInputService.InputBegan:Connect(function(inp,gpe)
-                        if not gpe and inp.KeyCode==b.keyCode then
-                            if not on then setOn(true) end
-                        end
-                    end)
-                    if b.holdEndConn then b.holdEndConn:Disconnect() end
-                    b.holdEndConn=UserInputService.InputEnded:Connect(function(inp)
-                        if inp.KeyCode==b.keyCode then
-                            if on then setOn(false) end
-                        end
-                    end)
-                end
+            if b.holdMode and b.keyCode then
+                if b.holdConn then b.holdConn:Disconnect() end
+                b.holdConn = UserInputService.InputBegan:Connect(function(inp, gpe)
+                    if not gpe and inp.KeyCode == b.keyCode and not on then setOn(true) end
+                end)
+                if b.holdEndConn then b.holdEndConn:Disconnect() end
+                b.holdEndConn = UserInputService.InputEnded:Connect(function(inp)
+                    if inp.KeyCode == b.keyCode and on then setOn(false) end
+                end)
             else
-                if b.holdConn then b.holdConn:Disconnect(); b.holdConn=nil end
-                if b.holdEndConn then b.holdEndConn:Disconnect(); b.holdEndConn=nil end
+                if b.holdConn then b.holdConn:Disconnect(); b.holdConn = nil end
+                if b.holdEndConn then b.holdEndConn:Disconnect(); b.holdEndConn = nil end
             end
         end)
 
         ctxRow("clear bind", 3, function()
-            local b=featureBinds[feat.key]
+            local b = featureBinds[feat.key]
             if b then
                 if b.holdConn then b.holdConn:Disconnect() end
                 if b.holdEndConn then b.holdEndConn:Disconnect() end
             end
-            featureBinds[feat.key]=nil
+            featureBinds[feat.key] = nil
         end)
     end
 
-    RunService.Heartbeat:Connect(function()
-        local b=featureBinds[feat.key]
-        if not b or not b.keyCode or b.holdMode then return end
-    end)
-
-    UserInputService.InputBegan:Connect(function(inp,gpe)
+    UserInputService.InputBegan:Connect(function(inp, gpe)
         if gpe then return end
-        local b=featureBinds[feat.key]
-        if b and b.keyCode and not b.holdMode and inp.KeyCode==b.keyCode then
+        local b = featureBinds[feat.key]
+        if b and b.keyCode and not b.holdMode and inp.KeyCode == b.keyCode then
             setOn(not on)
         end
     end)
-
-    clickZone.MouseButton2Click:Connect(openCtx)
-
+    cz.MouseButton2Click:Connect(openCtx)
     UserInputService.InputBegan:Connect(function(inp)
-        if ctxOpen and inp.UserInputType==Enum.UserInputType.MouseButton1 then
+        if ctxOpen and inp.UserInputType == Enum.UserInputType.MouseButton1 then
             task.defer(closeCtx)
         end
     end)
 end
 
-local FEATURES = {
-    {
-        key="PixelSurf", label="pixel surf", hint="auto",
-        sliderLabel="speed", minVal=20, maxVal=200, initVal=cfg.pixelMaxSpeed,
-        onChange=function(v) cfg.pixelMaxSpeed=v end,
-    },
-    {
-        key="TextureBug", label="texture bug", hint="auto",
-        sliderLabel="speed", minVal=20, maxVal=200, initVal=cfg.textureMaxSpeed,
-        onChange=function(v) cfg.textureMaxSpeed=v end,
-    },
-    {
-        key="AutoBhop", label="bunny hop", hint="[space]",
-        sliderLabel="boost", minVal=1, maxVal=100, initVal=math.floor(cfg.bhopBoost*10+0.5),
-        onChange=function(v) cfg.bhopBoost=v/10 end,
-    },
-    {
-        key="EdgeBug", label="edge bug", hint="auto",
-    },
-    {
-        key="JumpBug", label="jump bug", hint="[q]",
-        sliderLabel="power", minVal=10, maxVal=200, initVal=cfg.jumpBugPower,
-        onChange=function(v) cfg.jumpBugPower=v end,
-    },
-    {
-        key="LongJump", label="long jump", hint="[e]",
-        sliderLabel="power", minVal=20, maxVal=200, initVal=cfg.longJumpPower,
-        onChange=function(v) cfg.longJumpPower=v end,
-    },
-    {
-        key="MiniJump", label="mini jump", hint="[c]",
-        sliderLabel="power", minVal=5, maxVal=80, initVal=cfg.miniJumpPower,
-        onChange=function(v) cfg.miniJumpPower=v end,
-    },
-}
+-- ================================================================
+-- POPULATE MOVEMENT PANEL
+-- ================================================================
+makeSectionHeader(movPanel, "SURF")
+makeRow({key="PixelSurf",  label="pixel surf",  hint="auto",
+    sliderLabel="speed", minVal=20, maxVal=200, initVal=cfg.pixelMaxSpeed,
+    onChange=function(v) cfg.pixelMaxSpeed=v end}, movPanel)
+makeRow({key="TextureBug", label="texture bug", hint="auto",
+    sliderLabel="speed", minVal=20, maxVal=200, initVal=cfg.textureMaxSpeed,
+    onChange=function(v) cfg.textureMaxSpeed=v end}, movPanel)
 
-for _, feat in ipairs(FEATURES) do makeRow(feat) end
+makeSectionHeader(movPanel, "MOVEMENT")
+makeRow({key="AutoBhop", label="bunny hop", hint="[space]",
+    sliderLabel="boost", minVal=1, maxVal=100, initVal=math.floor(cfg.bhopBoost*10+0.5),
+    onChange=function(v) cfg.bhopBoost=v/10 end}, movPanel)
+makeRow({key="EdgeBug",  label="edge bug",  hint="auto"}, movPanel)
+makeRow({key="JumpBug",  label="jump bug",  hint="[q]",
+    sliderLabel="power", minVal=10, maxVal=200, initVal=cfg.jumpBugPower,
+    onChange=function(v) cfg.jumpBugPower=v end}, movPanel)
+makeRow({key="LongJump", label="long jump", hint="[e]",
+    sliderLabel="power", minVal=20, maxVal=200, initVal=cfg.longJumpPower,
+    onChange=function(v) cfg.longJumpPower=v end}, movPanel)
+makeRow({key="MiniJump", label="mini jump", hint="[c]",
+    sliderLabel="power", minVal=5, maxVal=80, initVal=cfg.miniJumpPower,
+    onChange=function(v) cfg.miniJumpPower=v end}, movPanel)
 
--- Fake aimbot special row
+-- Fake aimbot row
+makeSectionHeader(movPanel, "AIMBOT")
 do
-    local rowH = 110
-    local wrap=Instance.new("Frame")
-    wrap.Size=UDim2.new(1,0,0,rowH); wrap.BackgroundColor3=BG
-    wrap.BorderSizePixel=0; wrap.ZIndex=3; wrap.Parent=content
+    local ROW_H = 112
+    local wrap = Instance.new("Frame", movPanel)
+    wrap.Size = UDim2.new(1,0,0,ROW_H); wrap.BackgroundColor3 = G.BG; wrap.BorderSizePixel = 0; wrap.ZIndex = 3
+    local rowDiv = Instance.new("Frame", wrap)
+    rowDiv.Size = UDim2.new(1,0,0,1); rowDiv.Position = UDim2.new(0,0,1,-1)
+    rowDiv.BackgroundColor3 = G.DIV; rowDiv.BorderSizePixel = 0; rowDiv.ZIndex = 4
 
-    local rowDiv=Instance.new("Frame")
-    rowDiv.Size=UDim2.new(1,0,0,1); rowDiv.Position=UDim2.new(0,0,1,-1)
-    rowDiv.BackgroundColor3=DIVIDER; rowDiv.BorderSizePixel=0; rowDiv.ZIndex=4; rowDiv.Parent=wrap
+    local cb = Instance.new("Frame", wrap)
+    cb.Size = UDim2.new(0,11,0,11); cb.Position = UDim2.new(0,0,0,10)
+    cb.BackgroundColor3 = G.CB_OFF; cb.BorderSizePixel = 0; cb.ZIndex = 4
+    Instance.new("UICorner", cb).CornerRadius = UDim.new(0,2)
+    local cbS = Instance.new("UIStroke", cb); cbS.Color = G.DIV; cbS.Thickness = 1
 
-    local cb=Instance.new("Frame")
-    cb.Size=UDim2.new(0,10,0,10); cb.Position=UDim2.new(0,0,0,10)
-    cb.BackgroundColor3=CHECK_OFF; cb.BorderSizePixel=0; cb.ZIndex=4; cb.Parent=wrap
-    Instance.new("UICorner",cb).CornerRadius=UDim.new(0,2)
-    local cbStroke=Instance.new("UIStroke",cb); cbStroke.Color=DIVIDER; cbStroke.Thickness=1
+    local lbl = Instance.new("TextLabel", wrap)
+    lbl.Size = UDim2.new(1,-80,0,20); lbl.Position = UDim2.new(0,16,0,5)
+    lbl.BackgroundTransparency = 1; lbl.Text = "fake aimbot"
+    lbl.TextColor3 = G.DIM; lbl.Font = Enum.Font.GothamMedium; lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.ZIndex = 4
 
-    local lbl=Instance.new("TextLabel")
-    lbl.Size=UDim2.new(1,-80,0,20); lbl.Position=UDim2.new(0,16,0,4)
-    lbl.BackgroundTransparency=1; lbl.Text="fake aimbot"
-    lbl.TextColor3=TEXT_SEC; lbl.Font=Enum.Font.Code; lbl.TextSize=12
-    lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.ZIndex=4; lbl.Parent=wrap
+    local cz = Instance.new("TextButton", wrap)
+    cz.Size = UDim2.new(1,0,0,28); cz.BackgroundTransparency = 1; cz.Text = ""; cz.ZIndex = 5
 
-    local clickZone=Instance.new("TextButton")
-    clickZone.Size=UDim2.new(1,0,0,26); clickZone.BackgroundTransparency=1
-    clickZone.Text=""; clickZone.ZIndex=5; clickZone.Parent=wrap
+    buildSlider(wrap, 16, 30, "fov",    10, 120, cfg.aimbotFOV,    90,
+        function(v) cfg.aimbotFOV = v end)
+    buildSlider(wrap, 16, 48, "smooth",  1,  20, cfg.aimbotSmooth, 90,
+        function(v) cfg.aimbotSmooth = v end)
 
-    local function miniSlider(yOff, labelTxt, minV, maxV, initV, onCh)
-        local row=Instance.new("Frame")
-        row.Size=UDim2.new(1,-16,0,14); row.Position=UDim2.new(0,16,0,yOff)
-        row.BackgroundTransparency=1; row.ZIndex=4; row.Parent=wrap
+    local pkRow = Instance.new("Frame", wrap)
+    pkRow.Size = UDim2.new(1,-16,0,18); pkRow.Position = UDim2.new(0,16,0,66)
+    pkRow.BackgroundTransparency = 1; pkRow.ZIndex = 4
 
-        local sl=Instance.new("TextLabel")
-        sl.Size=UDim2.new(0,52,1,0); sl.BackgroundTransparency=1; sl.Text=labelTxt
-        sl.TextColor3=TEXT_DIM; sl.Font=Enum.Font.Code; sl.TextSize=9
-        sl.TextXAlignment=Enum.TextXAlignment.Left; sl.ZIndex=5; sl.Parent=row
+    local pkLbl = Instance.new("TextLabel", pkRow)
+    pkLbl.Size = UDim2.new(0,38,1,0); pkLbl.BackgroundTransparency = 1; pkLbl.Text = "aim key"
+    pkLbl.TextColor3 = G.MUTE; pkLbl.Font = Enum.Font.GothamMedium; pkLbl.TextSize = 9
+    pkLbl.TextXAlignment = Enum.TextXAlignment.Left; pkLbl.ZIndex = 5
 
-        local TW=90
-        local track=Instance.new("Frame")
-        track.Size=UDim2.new(0,TW,0,2); track.Position=UDim2.new(0,54,0.5,-1)
-        track.BackgroundColor3=DIVIDER; track.BorderSizePixel=0; track.ZIndex=5; track.Parent=row
-        Instance.new("UICorner",track).CornerRadius=UDim.new(1,0)
+    local pkBtn = Instance.new("TextButton", pkRow)
+    pkBtn.Size = UDim2.new(0,82,1,-2); pkBtn.Position = UDim2.new(0,40,0,1)
+    pkBtn.BackgroundColor3 = G.PANEL; pkBtn.BorderSizePixel = 0
+    pkBtn.Text = "rmb"; pkBtn.TextColor3 = G.WHITE
+    pkBtn.Font = Enum.Font.GothamMedium; pkBtn.TextSize = 9; pkBtn.ZIndex = 5
+    Instance.new("UICorner", pkBtn).CornerRadius = UDim.new(0,3)
+    local pkS = Instance.new("UIStroke", pkBtn); pkS.Color = G.DIV; pkS.Thickness = 1
+    pkBtn.MouseEnter:Connect(function() pkBtn.BackgroundColor3 = G.ROW_HVR end)
+    pkBtn.MouseLeave:Connect(function() pkBtn.BackgroundColor3 = G.PANEL end)
 
-        local frac=(initV-minV)/(maxV-minV)
-        local fill=Instance.new("Frame")
-        fill.Size=UDim2.new(frac,0,1,0); fill.BackgroundColor3=WHITE
-        fill.BorderSizePixel=0; fill.ZIndex=6; fill.Parent=track
-        Instance.new("UICorner",fill).CornerRadius=UDim.new(1,0)
-
-        local knob=Instance.new("Frame")
-        knob.Size=UDim2.new(0,7,0,7); knob.AnchorPoint=Vector2.new(0.5,0.5)
-        knob.Position=UDim2.new(frac,0,0.5,0); knob.BackgroundColor3=WHITE
-        knob.BorderSizePixel=0; knob.ZIndex=7; knob.Parent=track
-        Instance.new("UICorner",knob).CornerRadius=UDim.new(1,0)
-
-        local valL=Instance.new("TextLabel")
-        valL.Size=UDim2.new(0,28,1,0); valL.Position=UDim2.new(0,TW+58,0,0)
-        valL.BackgroundTransparency=1; valL.Text=tostring(initV)
-        valL.TextColor3=TEXT_SEC; valL.Font=Enum.Font.Code; valL.TextSize=9
-        valL.TextXAlignment=Enum.TextXAlignment.Left; valL.ZIndex=5; valL.Parent=row
-
-        local sd=false
-        local function apply(ax)
-            local t=math.clamp((ax-track.AbsolutePosition.X)/TW,0,1)
-            local v=math.floor(minV+t*(maxV-minV)+0.5)
-            local f2=(v-minV)/(maxV-minV)
-            fill.Size=UDim2.new(f2,0,1,0); knob.Position=UDim2.new(f2,0,0.5,0)
-            valL.Text=tostring(v); onCh(v)
-        end
-        track.InputBegan:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseButton1 then sd=true; apply(i.Position.X) end
-        end)
-        UserInputService.InputEnded:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseButton1 then sd=false end
-        end)
-        UserInputService.InputChanged:Connect(function(i)
-            if sd and i.UserInputType==Enum.UserInputType.MouseMovement then apply(i.Position.X) end
-        end)
-    end
-
-    miniSlider(28,  "fov",    10, 120, cfg.aimbotFOV,    function(v) cfg.aimbotFOV=v end)
-    miniSlider(46,  "smooth",  1,  20, cfg.aimbotSmooth, function(v) cfg.aimbotSmooth=v end)
-
-    local pickRow=Instance.new("Frame")
-    pickRow.Size=UDim2.new(1,-16,0,18); pickRow.Position=UDim2.new(0,16,0,64)
-    pickRow.BackgroundTransparency=1; pickRow.ZIndex=4; pickRow.Parent=wrap
-
-    local pickLbl=Instance.new("TextLabel")
-    pickLbl.Size=UDim2.new(0,52,1,0); pickLbl.BackgroundTransparency=1; pickLbl.Text="aim key"
-    pickLbl.TextColor3=TEXT_DIM; pickLbl.Font=Enum.Font.Code; pickLbl.TextSize=9
-    pickLbl.TextXAlignment=Enum.TextXAlignment.Left; pickLbl.ZIndex=5; pickLbl.Parent=pickRow
-
-    local pickBtn=Instance.new("TextButton")
-    pickBtn.Size=UDim2.new(0,90,1,0); pickBtn.Position=UDim2.new(0,54,0,0)
-    pickBtn.BackgroundColor3=Color3.fromRGB(28,28,28); pickBtn.BorderSizePixel=0
-    pickBtn.Text="rmb"; pickBtn.TextColor3=WHITE
-    pickBtn.Font=Enum.Font.Code; pickBtn.TextSize=9; pickBtn.ZIndex=5; pickBtn.Parent=pickRow
-    Instance.new("UICorner",pickBtn).CornerRadius=UDim.new(0,3)
-
-    local listening=false
-    local pickConn=nil
-
-    pickBtn.MouseButton1Click:Connect(function()
+    local listening = false; local pkConn = nil
+    pkBtn.MouseButton1Click:Connect(function()
         if listening then return end
-        listening=true
-        pickBtn.Text="[ press key ]"
-        pickBtn.TextColor3=TEXT_DIM
-
-        pickConn=UserInputService.InputBegan:Connect(function(input, gpe)
+        listening = true; pkBtn.Text = "..."; pkBtn.TextColor3 = G.MUTE
+        pkConn = UserInputService.InputBegan:Connect(function(input, gpe)
             if gpe then return end
             local name
-            if input.UserInputType==Enum.UserInputType.MouseButton1 then
-                cfg.aimbotButton=Enum.UserInputType.MouseButton1; name="lmb"
-            elseif input.UserInputType==Enum.UserInputType.MouseButton2 then
-                cfg.aimbotButton=Enum.UserInputType.MouseButton2; name="rmb"
-            elseif input.UserInputType==Enum.UserInputType.MouseButton3 then
-                cfg.aimbotButton=Enum.UserInputType.MouseButton3; name="mmb"
-            elseif input.UserInputType==Enum.UserInputType.Keyboard then
-                cfg.aimbotButton=input.KeyCode
-                name=tostring(input.KeyCode):gsub("Enum.KeyCode.",""):lower()
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                cfg.aimbotButton = Enum.UserInputType.MouseButton1; name = "lmb"
+            elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+                cfg.aimbotButton = Enum.UserInputType.MouseButton2; name = "rmb"
+            elseif input.UserInputType == Enum.UserInputType.MouseButton3 then
+                cfg.aimbotButton = Enum.UserInputType.MouseButton3; name = "mmb"
+            elseif input.UserInputType == Enum.UserInputType.Keyboard then
+                cfg.aimbotButton = input.KeyCode
+                name = tostring(input.KeyCode):gsub("Enum.KeyCode.",""):lower()
             else
                 return
             end
-            pickBtn.Text=name
-            pickBtn.TextColor3=WHITE
-            listening=false
-            if pickConn then pickConn:Disconnect(); pickConn=nil end
+            pkBtn.Text = name; pkBtn.TextColor3 = G.WHITE
+            listening = false; if pkConn then pkConn:Disconnect(); pkConn = nil end
         end)
     end)
 
-    local on=false
+    local on = false
     local function setOn(v)
-        on=v
+        on = v
         if v then
-            cb.BackgroundColor3=WHITE; cbStroke.Color=WHITE; lbl.TextColor3=WHITE
+            cb.BackgroundColor3 = G.GREEN; cbS.Color = G.GREEN; lbl.TextColor3 = G.WHITE
         else
-            cb.BackgroundColor3=CHECK_OFF; cbStroke.Color=DIVIDER; lbl.TextColor3=TEXT_SEC
+            cb.BackgroundColor3 = G.CB_OFF; cbS.Color = G.DIV; lbl.TextColor3 = G.DIM
         end
         toggleFeature("FakeAimbot")
     end
-    clickZone.MouseButton1Click:Connect(function() setOn(not on) end)
-    clickZone.MouseEnter:Connect(function() wrap.BackgroundColor3=ROW_HOVER end)
-    clickZone.MouseLeave:Connect(function() wrap.BackgroundColor3=BG end)
+    cz.MouseButton1Click:Connect(function() setOn(not on) end)
+    cz.MouseEnter:Connect(function() wrap.BackgroundColor3 = G.ROW_HVR end)
+    cz.MouseLeave:Connect(function() wrap.BackgroundColor3 = G.BG end)
 end
 
--- Visuals rows
-do
-    local function makeVisRow(labelTxt, sliderLbl, minV, maxV, initV, onToggle, onSlide)
-        local rowH = 50
-        local wrap=Instance.new("Frame")
-        wrap.Size=UDim2.new(1,0,0,rowH); wrap.BackgroundColor3=BG
-        wrap.BorderSizePixel=0; wrap.ZIndex=3; wrap.Parent=visContent
+-- ================================================================
+-- POPULATE VISUALS PANEL
+-- ================================================================
+makeSectionHeader(visPanel, "EFFECTS")
 
-        local rowDiv=Instance.new("Frame")
-        rowDiv.Size=UDim2.new(1,0,0,1); rowDiv.Position=UDim2.new(0,0,1,-1)
-        rowDiv.BackgroundColor3=DIVIDER; rowDiv.BorderSizePixel=0; rowDiv.ZIndex=4; rowDiv.Parent=wrap
+local function makeVisRow(labelTxt, sliderLbl, minV, maxV, initV, onToggle, onSlide)
+    local ROW_H = 50
+    local wrap = Instance.new("Frame", visPanel)
+    wrap.Size = UDim2.new(1,0,0,ROW_H); wrap.BackgroundColor3 = G.BG; wrap.BorderSizePixel = 0; wrap.ZIndex = 3
+    local rowDiv = Instance.new("Frame", wrap)
+    rowDiv.Size = UDim2.new(1,0,0,1); rowDiv.Position = UDim2.new(0,0,1,-1)
+    rowDiv.BackgroundColor3 = G.DIV; rowDiv.BorderSizePixel = 0; rowDiv.ZIndex = 4
 
-        local cb=Instance.new("Frame")
-        cb.Size=UDim2.new(0,10,0,10); cb.Position=UDim2.new(0,0,0,10)
-        cb.BackgroundColor3=CHECK_OFF; cb.BorderSizePixel=0; cb.ZIndex=4; cb.Parent=wrap
-        Instance.new("UICorner",cb).CornerRadius=UDim.new(0,2)
-        local cbS=Instance.new("UIStroke",cb); cbS.Color=DIVIDER; cbS.Thickness=1
+    local cb = Instance.new("Frame", wrap)
+    cb.Size = UDim2.new(0,11,0,11); cb.Position = UDim2.new(0,0,0,10)
+    cb.BackgroundColor3 = G.CB_OFF; cb.BorderSizePixel = 0; cb.ZIndex = 4
+    Instance.new("UICorner", cb).CornerRadius = UDim.new(0,2)
+    local cbS = Instance.new("UIStroke", cb); cbS.Color = G.DIV; cbS.Thickness = 1
 
-        local lbl=Instance.new("TextLabel")
-        lbl.Size=UDim2.new(1,-80,0,20); lbl.Position=UDim2.new(0,16,0,4)
-        lbl.BackgroundTransparency=1; lbl.Text=labelTxt
-        lbl.TextColor3=TEXT_SEC; lbl.Font=Enum.Font.Code; lbl.TextSize=12
-        lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.ZIndex=4; lbl.Parent=wrap
+    local lbl = Instance.new("TextLabel", wrap)
+    lbl.Size = UDim2.new(1,-80,0,20); lbl.Position = UDim2.new(0,16,0,5)
+    lbl.BackgroundTransparency = 1; lbl.Text = labelTxt
+    lbl.TextColor3 = G.DIM; lbl.Font = Enum.Font.GothamMedium; lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.ZIndex = 4
 
-        local click=Instance.new("TextButton")
-        click.Size=UDim2.new(1,0,0,26); click.BackgroundTransparency=1
-        click.Text=""; click.ZIndex=5; click.Parent=wrap
+    local cz = Instance.new("TextButton", wrap)
+    cz.Size = UDim2.new(1,0,0,28); cz.BackgroundTransparency = 1; cz.Text = ""; cz.ZIndex = 5
 
-        local sRow=Instance.new("Frame")
-        sRow.Size=UDim2.new(1,-16,0,14); sRow.Position=UDim2.new(0,16,0,28)
-        sRow.BackgroundTransparency=1; sRow.ZIndex=4; sRow.Parent=wrap
+    buildSlider(wrap, 16, 30, sliderLbl, minV, maxV, initV, TW, onSlide)
 
-        local sLbl=Instance.new("TextLabel")
-        sLbl.Size=UDim2.new(0,30,1,0); sLbl.BackgroundTransparency=1; sLbl.Text=sliderLbl
-        sLbl.TextColor3=TEXT_DIM; sLbl.Font=Enum.Font.Code; sLbl.TextSize=9
-        sLbl.TextXAlignment=Enum.TextXAlignment.Left; sLbl.ZIndex=5; sLbl.Parent=sRow
-
-        local TW=TRACK_W
-        local track=Instance.new("Frame")
-        track.Size=UDim2.new(0,TW,0,2); track.Position=UDim2.new(0,32,0.5,-1)
-        track.BackgroundColor3=DIVIDER; track.BorderSizePixel=0; track.ZIndex=5; track.Parent=sRow
-        Instance.new("UICorner",track).CornerRadius=UDim.new(1,0)
-
-        local frac=(initV-minV)/(maxV-minV)
-        local fill=Instance.new("Frame")
-        fill.Size=UDim2.new(frac,0,1,0); fill.BackgroundColor3=WHITE
-        fill.BorderSizePixel=0; fill.ZIndex=6; fill.Parent=track
-        Instance.new("UICorner",fill).CornerRadius=UDim.new(1,0)
-
-        local knob=Instance.new("Frame")
-        knob.Size=UDim2.new(0,7,0,7); knob.AnchorPoint=Vector2.new(0.5,0.5)
-        knob.Position=UDim2.new(frac,0,0.5,0); knob.BackgroundColor3=WHITE
-        knob.BorderSizePixel=0; knob.ZIndex=7; knob.Parent=track
-        Instance.new("UICorner",knob).CornerRadius=UDim.new(1,0)
-
-        local valL=Instance.new("TextLabel")
-        valL.Size=UDim2.new(0,30,1,0); valL.Position=UDim2.new(0,TW+36,0,0)
-        valL.BackgroundTransparency=1; valL.Text=tostring(initV)
-        valL.TextColor3=TEXT_SEC; valL.Font=Enum.Font.Code; valL.TextSize=9
-        valL.TextXAlignment=Enum.TextXAlignment.Left; valL.ZIndex=5; valL.Parent=sRow
-
-        local sd=false
-        local function applyS(ax)
-            local t=math.clamp((ax-track.AbsolutePosition.X)/TW,0,1)
-            local v=math.floor(minV+t*(maxV-minV)+0.5)
-            local f2=(v-minV)/(maxV-minV)
-            fill.Size=UDim2.new(f2,0,1,0); knob.Position=UDim2.new(f2,0,0.5,0)
-            valL.Text=tostring(v); onSlide(v)
+    local on = false
+    local function setOn(v)
+        on = v
+        if v then
+            cb.BackgroundColor3 = G.GREEN; cbS.Color = G.GREEN; lbl.TextColor3 = G.WHITE
+        else
+            cb.BackgroundColor3 = G.CB_OFF; cbS.Color = G.DIV; lbl.TextColor3 = G.DIM
         end
-        track.InputBegan:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseButton1 then sd=true; applyS(i.Position.X) end
-        end)
-        UserInputService.InputEnded:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseButton1 then sd=false end
-        end)
-        UserInputService.InputChanged:Connect(function(i)
-            if sd and i.UserInputType==Enum.UserInputType.MouseMovement then applyS(i.Position.X) end
-        end)
+        onToggle(v)
+    end
+    cz.MouseButton1Click:Connect(function() setOn(not on) end)
+    cz.MouseEnter:Connect(function() wrap.BackgroundColor3 = G.ROW_HVR end)
+    cz.MouseLeave:Connect(function() wrap.BackgroundColor3 = G.BG end)
+end
 
-        local on=false
-        local function setOn(v)
-            on=v
-            if v then cb.BackgroundColor3=WHITE; cbS.Color=WHITE; lbl.TextColor3=WHITE
-            else cb.BackgroundColor3=CHECK_OFF; cbS.Color=DIVIDER; lbl.TextColor3=TEXT_SEC end
-            onToggle(v)
+makeVisRow("fog",         "distance", 20, 500, cfg.fogEnd,    setFog,    function(v) cfg.fogEnd = v end)
+makeVisRow("motion blur", "intensity",  1,  40, cfg.blurSize, setBlur,   function(v) cfg.blurSize = v end)
+
+makeSectionHeader(visPanel, "ESP")
+-- Simple toggle row
+local function makeToggleRow(parent, labelTxt, initOn, onToggle)
+    local ROW_H = 30
+    local wrap = Instance.new("Frame", parent)
+    wrap.Size = UDim2.new(1,0,0,ROW_H); wrap.BackgroundColor3 = G.BG; wrap.BorderSizePixel = 0; wrap.ZIndex = 3
+    local rowDiv = Instance.new("Frame", wrap)
+    rowDiv.Size = UDim2.new(1,0,0,1); rowDiv.Position = UDim2.new(0,0,1,-1)
+    rowDiv.BackgroundColor3 = G.DIV; rowDiv.BorderSizePixel = 0; rowDiv.ZIndex = 4
+    local cb = Instance.new("Frame", wrap)
+    cb.Size = UDim2.new(0,11,0,11); cb.Position = UDim2.new(0,0,0,10)
+    cb.BackgroundColor3 = G.CB_OFF; cb.BorderSizePixel = 0; cb.ZIndex = 4
+    Instance.new("UICorner", cb).CornerRadius = UDim.new(0,2)
+    local cbS = Instance.new("UIStroke", cb); cbS.Color = G.DIV; cbS.Thickness = 1
+    local lbl = Instance.new("TextLabel", wrap)
+    lbl.Size = UDim2.new(1,-16,0,20); lbl.Position = UDim2.new(0,16,0,5)
+    lbl.BackgroundTransparency = 1; lbl.Text = labelTxt
+    lbl.TextColor3 = G.DIM; lbl.Font = Enum.Font.GothamMedium; lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.ZIndex = 4
+    local cz = Instance.new("TextButton", wrap)
+    cz.Size = UDim2.new(1,0,0,ROW_H); cz.BackgroundTransparency = 1; cz.Text = ""; cz.ZIndex = 5
+
+    local on = initOn
+    local function setOn(v)
+        on = v
+        if v then
+            cb.BackgroundColor3 = G.GREEN; cbS.Color = G.GREEN; lbl.TextColor3 = G.WHITE
+        else
+            cb.BackgroundColor3 = G.CB_OFF; cbS.Color = G.DIV; lbl.TextColor3 = G.DIM
         end
-        click.MouseButton1Click:Connect(function() setOn(not on) end)
-        click.MouseEnter:Connect(function() wrap.BackgroundColor3=ROW_HOVER end)
-        click.MouseLeave:Connect(function() wrap.BackgroundColor3=BG end)
+        onToggle(v)
     end
-
-    makeVisRow("fog", "distance", 20, 500, cfg.fogEnd,
-        function(on) setFog(on) end,
-        function(v) cfg.fogEnd=v end)
-
-    makeVisRow("motion blur", "intensity", 1, 40, cfg.blurSize,
-        function(on) setBlur(on) end,
-        function(v) cfg.blurSize=v end)
+    setOn(initOn)
+    cz.MouseButton1Click:Connect(function() setOn(not on) end)
+    cz.MouseEnter:Connect(function() wrap.BackgroundColor3 = G.ROW_HVR end)
+    cz.MouseLeave:Connect(function() wrap.BackgroundColor3 = G.BG end)
 end
 
--- ================================================================
--- RESTART
--- ================================================================
-local function restartFeature(key)
-    local f=features[key]
-    if f.conn then f.conn:Disconnect(); f.conn=nil end
+makeToggleRow(visPanel, "enable esp", false, toggleESP)
 
-    if     key=="PixelSurf"  then makeSurf(key,Vector3.new(0,0,0),   function() return cfg.pixelMaxSpeed   end)
-    elseif key=="TextureBug" then makeSurf(key,Vector3.new(0,2.5,0), function() return cfg.textureMaxSpeed end)
-    elseif key=="AutoBhop"   then bhop_start()
-    elseif key=="EdgeBug"    then edgebug_start()
-    elseif key=="JumpBug"    then jumpbug_start()
-    elseif key=="LongJump"   then longjump_start()
-    elseif key=="MiniJump"   then minijump_start()
-    elseif key=="FakeAimbot" then fakeaimbot_start()
-    end
-end
+makeSectionHeader(visPanel, "HUD")
+makeToggleRow(visPanel, "watermark",  true,  function(v) wmFrame.Visible = v end)
+makeToggleRow(visPanel, "indicators", true,  function(v) indBar.Visible = v end)
 
 -- ================================================================
--- MENU TOGGLE  [INSERT]
+-- MENU TOGGLE & UNLOAD
 -- ================================================================
-local menuOpen=false
-
+local menuOpen = false
 local function setMenuOpen(open)
-    menuOpen      = open
-    win.Visible   = open
+    menuOpen = open
+    win.Visible = open
     if open then
-        UserInputService.MouseBehavior  = Enum.MouseBehavior.Default
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
         UserInputService.MouseIconEnabled = true
     else
-        UserInputService.MouseBehavior  = Enum.MouseBehavior.Default
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
     end
 end
 
 RunService.RenderStepped:Connect(function()
     if menuOpen then
-        UserInputService.MouseBehavior    = Enum.MouseBehavior.Default
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
         UserInputService.MouseIconEnabled = true
     end
 end)
 
 local unloadHeld = {}
-UserInputService.InputBegan:Connect(function(input,gpe)
-    if not gpe and input.KeyCode==Enum.KeyCode.Insert then
-        setMenuOpen(not menuOpen)
-    end
-
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if not gpe and input.KeyCode == Enum.KeyCode.Insert then setMenuOpen(not menuOpen) end
     if not gpe then
         unloadHeld[input.KeyCode] = true
         if unloadHeld[Enum.KeyCode.U] and unloadHeld[Enum.KeyCode.O] then
             for key in pairs(features) do stopFeature(key) end
+            toggleESP(false)
             setFog(false); setBlur(false)
-            if fogConn then fogConn:Disconnect(); fogConn=nil end
-            if blurConn then blurConn:Disconnect(); blurConn=nil end
+            if fogConn then fogConn:Disconnect() end
+            if blurConn then blurConn:Disconnect() end
             trailFolder:Destroy()
             screenGui:Destroy()
-            UserInputService.MouseBehavior    = Enum.MouseBehavior.Default
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
             UserInputService.MouseIconEnabled = true
         end
     end
 end)
-
 UserInputService.InputEnded:Connect(function(input)
     unloadHeld[input.KeyCode] = nil
-end)
-
--- ================================================================
--- RESPAWN
--- ================================================================
-player.CharacterAdded:Connect(function(char)
-    bindCharacter(char)
-    task.wait(0.5)
-    for key,f in pairs(features) do
-        if f.enabled then
-            restartFeature(key)
-        end
-    end
 end)

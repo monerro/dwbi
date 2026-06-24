@@ -1,7 +1,3 @@
--- ================================================================
--- dwbi | movement + ESP + SKINS  (Clarity menu)
--- Toggle menu: [INSERT]   |   Unload: hold U + O
--- ================================================================
 
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")

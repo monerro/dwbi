@@ -24,8 +24,10 @@ local cfg = {
 	aimbotKeybind   = "MouseButton2",
 	fogEnd          = 200,
 	blurSize        = 10,
-	spinSpeed       = 720, -- degrees per second
-	spinMode        = "Both", -- "Off", "Body Only", "Head Only", "Both"
+	spinSpeed       = 720,
+	spinMode        = "Both",
+	noSpreadMin     = 5,
+	noSpreadMax     = 15,
 }
 
 local keybindOverrides = {
@@ -40,6 +42,70 @@ local keybindOverrides = {
 local function getKeyNameFromEnum(keyEnum)
 	if not keyEnum then return "auto" end
 	return keyEnum.Name
+end
+
+-- NO-SPREAD SYSTEM
+local noSpreadActive = false
+local currentSpreadFolder = nil
+local originalSpreadValuesNS = {}
+
+local function getEquippedGunNameNS()
+	local char = player.Character
+	if not char then return nil end
+	local gun = char:FindFirstChild("Gun")
+	return gun and gun:GetAttribute("GunName")
+end
+
+local function getCurrentSpreadFolder()
+	local gunName = getEquippedGunNameNS()
+	if not gunName then return nil end
+	local weapons = ReplicatedStorage:FindFirstChild("Weapons")
+	if not weapons then return nil end
+	local gunFolder = weapons:FindFirstChild(gunName)
+	if not gunFolder then return nil end
+	return gunFolder:FindFirstChild("Spread")
+end
+
+local function saveOriginalsNS(spreadFolder)
+	if not spreadFolder then return end
+	local gunName = getEquippedGunNameNS()
+	if not gunName then return end
+	if originalSpreadValuesNS[gunName] then return end
+	originalSpreadValuesNS[gunName] = {}
+	for _, v in ipairs(spreadFolder:GetChildren()) do
+		if v:IsA("NumberValue") or v:IsA("IntValue") or v:IsA("FloatValue") then
+			originalSpreadValuesNS[gunName][v] = v.Value
+		end
+	end
+end
+
+local function applyLowSpread(spreadFolder)
+	if not spreadFolder then return end
+	for _, v in ipairs(spreadFolder:GetChildren()) do
+		if v:IsA("NumberValue") or v:IsA("IntValue") or v:IsA("FloatValue") then
+			v.Value = math.random(cfg.noSpreadMin, cfg.noSpreadMax) / 100
+		end
+	end
+end
+
+local function restoreSpreadNS(spreadFolder)
+	local gunName = getEquippedGunNameNS()
+	if not gunName then return end
+	if not originalSpreadValuesNS[gunName] then return end
+	for v, originalVal in pairs(originalSpreadValuesNS[gunName]) do
+		if v and v.Parent then v.Value = originalVal end
+	end
+end
+
+local function toggleNoSpreadFunc(enabled)
+	noSpreadActive = enabled
+	if enabled then
+		currentSpreadFolder = getCurrentSpreadFolder()
+		if currentSpreadFolder then saveOriginalsNS(currentSpreadFolder) end
+	else
+		if currentSpreadFolder then restoreSpreadNS(currentSpreadFolder) end
+		currentSpreadFolder = nil
+	end
 end
 
 ----------------------------------------------------------------------
@@ -180,13 +246,11 @@ local function createContextMenu(featureKey, currentKey, currentMode, position)
 	divider.BackgroundColor3 = Color3.fromRGB(38,38,38); divider.BorderSizePixel = 0
 	divider.LayoutOrder = 1; divider.Parent = contextMenu
 
-	-- Key row
 	local keyRow = Instance.new("Frame"); keyRow.Size = UDim2.new(1,0,0,28); keyRow.BackgroundTransparency=1; keyRow.LayoutOrder=2; keyRow.Parent=contextMenu
 	local keyLabel = Instance.new("TextLabel"); keyLabel.Text="Key:"; keyLabel.Font=Enum.Font.Gotham; keyLabel.TextSize=11; keyLabel.TextColor3=Color3.fromRGB(150,150,150); keyLabel.BackgroundTransparency=1; keyLabel.Size=UDim2.new(0.4,0,1,0); keyLabel.TextXAlignment=Enum.TextXAlignment.Left; keyLabel.Parent=keyRow
 	local keyButton = Instance.new("TextButton"); keyButton.Text=currentKey and getKeyNameFromEnum(currentKey) or "auto"; keyButton.Font=Enum.Font.Gotham; keyButton.TextSize=11; keyButton.TextColor3=Color3.fromRGB(240,240,240); keyButton.BackgroundColor3=Color3.fromRGB(18,18,18); keyButton.Size=UDim2.new(0.55,0,1,0); keyButton.Position=UDim2.new(0.45,0,0,0); keyButton.Parent=keyRow
 	Instance.new("UICorner",keyButton).CornerRadius=UDim.new(0,4)
 
-	-- Mode row
 	local modeRow = Instance.new("Frame"); modeRow.Size=UDim2.new(1,0,0,28); modeRow.BackgroundTransparency=1; modeRow.LayoutOrder=3; modeRow.Parent=contextMenu
 	local modeLabel = Instance.new("TextLabel"); modeLabel.Text="Mode:"; modeLabel.Font=Enum.Font.Gotham; modeLabel.TextSize=11; modeLabel.TextColor3=Color3.fromRGB(150,150,150); modeLabel.BackgroundTransparency=1; modeLabel.Size=UDim2.new(0.4,0,1,0); modeLabel.TextXAlignment=Enum.TextXAlignment.Left; modeLabel.Parent=modeRow
 	local modeDropdown = Instance.new("TextButton"); modeDropdown.Text=currentMode or "auto"; modeDropdown.Font=Enum.Font.Gotham; modeDropdown.TextSize=11; modeDropdown.TextColor3=Color3.fromRGB(240,240,240); modeDropdown.BackgroundColor3=Color3.fromRGB(18,18,18); modeDropdown.Size=UDim2.new(0.55,0,1,0); modeDropdown.Position=UDim2.new(0.45,0,0,0); modeDropdown.Parent=modeRow
@@ -407,26 +471,17 @@ end
 ----------------------------------------------------------------------
 -- SPINBOT
 ----------------------------------------------------------------------
--- Body spin: rotates HRP yaw while preserving position + velocity.
--- Head nod:  manipulates Neck Motor6D C0 to oscillate pitch 0->180->0
---            every ~0.5s so the head looks directly down and back up.
--- The camera and actual movement are completely untouched because:
---   - Camera is controlled by Roblox independently of HRP rotation
---   - We restore velocity after CFrame override so physics isn't affected
-
 local spinAngle   = 0
 local headTimer   = 0
-local HEAD_PERIOD = 0.5 -- seconds for full 0->180->0 cycle
+local HEAD_PERIOD = 0.5
 
 local function getNeck()
 	if not character then return nil end
-	-- Try R15 first
 	local upperTorso = character:FindFirstChild("UpperTorso")
 	if upperTorso then
 		local neck = upperTorso:FindFirstChild("Neck")
 		if neck and neck:IsA("Motor6D") then return neck end
 	end
-	-- R6 fallback
 	local torso = character:FindFirstChild("Torso")
 	if torso then
 		local neck = torso:FindFirstChild("Neck")
@@ -435,14 +490,12 @@ local function getNeck()
 	return nil
 end
 
--- Store original neck C0 so we can restore it
 local originalNeckC0 = nil
 
 local function spinbot_stop()
 	local f = features.Spinbot
 	if f.bodyConn then f.bodyConn:Disconnect(); f.bodyConn=nil end
 	if f.headConn then f.headConn:Disconnect(); f.headConn=nil end
-	-- Restore neck
 	if originalNeckC0 then
 		local neck = getNeck()
 		if neck then neck.C0 = originalNeckC0 end
@@ -456,40 +509,25 @@ local function spinbot_start()
 	local f = features.Spinbot
 	spinAngle = 0
 	headTimer = 0
-
-	local mode = cfg.spinMode -- "Body Only", "Head Only", "Both"
-
-	-- Save original neck C0
+	local mode = cfg.spinMode
 	local neck = getNeck()
-	if neck and not originalNeckC0 then
-		originalNeckC0 = neck.C0
-	end
-
-	-- Body spin connection
+	if neck and not originalNeckC0 then originalNeckC0 = neck.C0 end
 	if mode == "Body Only" or mode == "Both" then
 		f.bodyConn = RunService.RenderStepped:Connect(function(dt)
 			if not hrp then return end
 			spinAngle = (spinAngle + cfg.spinSpeed * dt) % 360
-			-- Preserve linear velocity so movement is unaffected
 			local vel = hrp.AssemblyLinearVelocity
 			hrp.CFrame = CFrame.new(hrp.Position) * CFrame.Angles(0, math.rad(spinAngle), 0)
 			hrp.AssemblyLinearVelocity = vel
 		end)
 	end
-
-	-- Head nod connection
 	if mode == "Head Only" or mode == "Both" then
 		f.headConn = RunService.RenderStepped:Connect(function(dt)
 			headTimer = headTimer + dt
 			local neck2 = getNeck()
 			if not neck2 or not originalNeckC0 then return end
-			-- sin oscillates -1 to 1; we map that to 0->pi (0->180 degrees)
-			-- sin(t * 2pi / period) gives full cycle in `period` seconds
-			-- We want pitch going from 0 to +180 back to 0, so:
-			-- angle = (1 - cos(2pi * t / period)) / 2 * pi
 			local cycle = (1 - math.cos(2 * math.pi * headTimer / HEAD_PERIOD)) / 2
-			local pitch  = cycle * math.pi -- 0 -> pi -> 0
-			-- Apply on top of original C0 so it stacks correctly
+			local pitch  = cycle * math.pi
 			neck2.C0 = originalNeckC0 * CFrame.Angles(-pitch, 0, 0)
 		end)
 	end
@@ -533,12 +571,9 @@ end
 ----------------------------------------------------------------------
 -- HUD REMOVER
 ----------------------------------------------------------------------
--- Hides all ScreenGui objects that belong to the game (not our own)
--- and re-shows them when toggled off.
-
 local OUR_GUIS = {
 	"ClarityMenu", "LarpWatermark", "ClarityMomentum",
-	"VelocityGraph", "PlayerGui" -- safety strings
+	"VelocityGraph", "PlayerGui"
 }
 local function isOurGui(gui)
 	for _, name in ipairs(OUR_GUIS) do
@@ -551,7 +586,6 @@ local function setHudRemoved(enabled)
 	hudRemoved = enabled
 	local playerGui = player:FindFirstChildOfClass("PlayerGui")
 	if not playerGui then return end
-
 	if enabled then
 		hiddenHudItems = {}
 		for _, gui in ipairs(playerGui:GetChildren()) do
@@ -564,9 +598,7 @@ local function setHudRemoved(enabled)
 		end
 	else
 		for _, gui in ipairs(hiddenHudItems) do
-			if gui and gui.Parent then
-				gui.Enabled = true
-			end
+			if gui and gui.Parent then gui.Enabled = true end
 		end
 		hiddenHudItems = {}
 	end
@@ -596,7 +628,6 @@ local function toggleFeature(key)
 		elseif key=="Spinbot"    then spinbot_start()
 		end
 	else stopFeature(key) end
-	refreshIndicators()
 	return f.enabled
 end
 
@@ -892,103 +923,12 @@ local function toggleMomentum(enabled)
 end
 
 ----------------------------------------------------------------------
--- VELOCITY GRAPH (Drawing API, no background, white line, centred)
-----------------------------------------------------------------------
-local velocityGraphEnabled   = false
-local velocityGraphConn      = nil
-local velocityHistory        = {}
-local velGraphLines          = {} -- Drawing.Line objects we reuse
-local MAX_VEL_POINTS         = 120
-local GRAPH_W                = 300
-local GRAPH_H                = 60
-local MAX_DISPLAY_SPEED      = 100
-
-local function getGraphOrigin()
-	-- Bottom-centre of screen, floated up a little
-	local vp = camera.ViewportSize
-	return Vector2.new(vp.X / 2 - GRAPH_W / 2, vp.Y - GRAPH_H - 38)
-end
-
-local function clearVelLines()
-	for _, l in ipairs(velGraphLines) do
-		l.Visible = false
-	end
-end
-
-local function ensureVelLines(count)
-	while #velGraphLines < count do
-		local l = Drawing.new("Line")
-		l.Thickness  = 1.5
-		l.Color      = Color3.new(1, 1, 1)
-		l.Transparency = 1
-		l.Visible    = false
-		table.insert(velGraphLines, l)
-	end
-end
-
-local function drawVelGraph()
-	clearVelLines()
-	local count = #velocityHistory
-	if count < 2 then return end
-
-	local origin = getGraphOrigin()
-	local maxV   = MAX_DISPLAY_SPEED
-
-	-- Find actual max in history so the line never clips
-	local actualMax = 0
-	for _, v in ipairs(velocityHistory) do if v > actualMax then actualMax = v end end
-	if actualMax > maxV then maxV = actualMax end
-	if maxV < 1 then maxV = 1 end
-
-	ensureVelLines(count - 1)
-
-	for i = 1, count - 1 do
-		local x1 = (i - 1) / (count - 1) * GRAPH_W + origin.X
-		local x2 = i       / (count - 1) * GRAPH_W + origin.X
-		local y1 = origin.Y + GRAPH_H - (velocityHistory[i]     / maxV * GRAPH_H)
-		local y2 = origin.Y + GRAPH_H - (velocityHistory[i + 1] / maxV * GRAPH_H)
-
-		local l = velGraphLines[i]
-		l.From        = Vector2.new(x1, math.clamp(y1, origin.Y, origin.Y + GRAPH_H))
-		l.To          = Vector2.new(x2, math.clamp(y2, origin.Y, origin.Y + GRAPH_H))
-		l.Visible     = true
-		l.Color       = Color3.new(1, 1, 1)
-		l.Transparency = 1
-		l.Thickness   = 1.5
-	end
-end
-
-local function toggleVelocityGraph(enabled)
-	velocityGraphEnabled = enabled
-
-	if enabled then
-		velocityHistory = {}
-		velocityGraphConn = RunService.RenderStepped:Connect(function()
-			if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
-				drawVelGraph(); return
-			end
-			local hrp2 = player.Character.HumanoidRootPart
-			local vel  = hrp2.AssemblyLinearVelocity
-			local speed = math.floor(Vector3.new(vel.X, 0, vel.Z).Magnitude)
-			table.insert(velocityHistory, speed)
-			if #velocityHistory > MAX_VEL_POINTS then table.remove(velocityHistory, 1) end
-			drawVelGraph()
-		end)
-	else
-		if velocityGraphConn then velocityGraphConn:Disconnect(); velocityGraphConn = nil end
-		clearVelLines()
-		velocityHistory = {}
-	end
-end
-
-----------------------------------------------------------------------
--- INDICATORS & WASD
+-- SCREEN GUI & WATERMARK
 ----------------------------------------------------------------------
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name="ClarityMenu"; screenGui.ResetOnSpawn=false; screenGui.ZIndexBehavior=Enum.ZIndexBehavior.Global
 screenGui.DisplayOrder=9999; screenGui.IgnoreGuiInset=true; screenGui.Parent=player:WaitForChild("PlayerGui")
 
--- Watermark
 local wmFrame=Instance.new("Frame"); wmFrame.Size=UDim2.new(0,0,0,22); wmFrame.AutomaticSize=Enum.AutomaticSize.X; wmFrame.Position=UDim2.new(1,0,0,8); wmFrame.AnchorPoint=Vector2.new(1,0); wmFrame.BackgroundColor3=Color3.fromRGB(10,10,12); wmFrame.BorderSizePixel=0; wmFrame.ZIndex=10; wmFrame.Parent=screenGui
 Instance.new("UICorner",wmFrame).CornerRadius=UDim.new(0,4)
 Instance.new("UIStroke",wmFrame).Color=Color3.fromRGB(30,30,38)
@@ -996,57 +936,21 @@ local wmPad=Instance.new("UIPadding",wmFrame); wmPad.PaddingLeft=UDim.new(0,8); 
 local wmLayout=Instance.new("UIListLayout",wmFrame); wmLayout.FillDirection=Enum.FillDirection.Horizontal; wmLayout.VerticalAlignment=Enum.VerticalAlignment.Center; wmLayout.Padding=UDim.new(0,0)
 local function wmPart(txt,col) local l=Instance.new("TextLabel"); l.Size=UDim2.new(0,0,1,0); l.AutomaticSize=Enum.AutomaticSize.X; l.BackgroundTransparency=1; l.Text=txt; l.TextColor3=col; l.Font=Enum.Font.GothamMedium; l.TextSize=11; l.ZIndex=11; l.Parent=wmFrame; return l end
 local wmName=wmPart("clarity",Color3.fromRGB(76,210,96)); local wmSep1=wmPart(" | ",Color3.fromRGB(45,45,55)); local wmUser=wmPart(player.Name,Color3.fromRGB(230,230,230)); local wmSep2=wmPart(" | ",Color3.fromRGB(45,45,55)); local wmFps=wmPart("0 fps",Color3.fromRGB(90,90,105))
-local fpsCounter=0; RunService.RenderStepped:Connect(function(dt) fpsCounter=fpsCounter+1; if fpsCounter>=10 then fpsCounter=0; wmFps.Text=math.floor(1/math.max(dt,0.001)+0.5).." fps" end end)
-
--- Indicator bar
-local indBar=Instance.new("Frame"); indBar.Size=UDim2.new(0,0,0,22); indBar.AutomaticSize=Enum.AutomaticSize.X; indBar.Position=UDim2.new(0.5,0,1,-10); indBar.AnchorPoint=Vector2.new(0.5,1); indBar.BackgroundColor3=Color3.fromRGB(10,10,12); indBar.BorderSizePixel=0; indBar.ZIndex=10; indBar.Parent=screenGui
-Instance.new("UICorner",indBar).CornerRadius=UDim.new(0,4); Instance.new("UIStroke",indBar).Color=Color3.fromRGB(30,30,38)
-local ibLayout=Instance.new("UIListLayout",indBar); ibLayout.FillDirection=Enum.FillDirection.Horizontal; ibLayout.Padding=UDim.new(0,6)
-local ibPad=Instance.new("UIPadding",indBar); ibPad.PaddingLeft=UDim.new(0,8); ibPad.PaddingRight=UDim.new(0,8); ibPad.PaddingTop=UDim.new(0,3); ibPad.PaddingBottom=UDim.new(0,3)
-local IND_ORDER={"ps","tb","lj","mj","jb","bh","amb","sp"}
-local IND_MAP={ps="PixelSurf",tb="TextureBug",lj="LongJump",mj="MiniJump",jb="JumpBug",bh="AutoBhop",amb="FakeAimbot",sp="Spinbot"}
-local indicatorLabels={}
-for i,tag in ipairs(IND_ORDER) do
-	local key=IND_MAP[tag]; local l=Instance.new("TextLabel"); l.Size=UDim2.new(0,0,1,0); l.AutomaticSize=Enum.AutomaticSize.X; l.BackgroundTransparency=1; l.Text=tag; l.TextColor3=Color3.fromRGB(45,45,55); l.Font=Enum.Font.GothamMedium; l.TextSize=11; l.LayoutOrder=i; l.ZIndex=11; l.Parent=indBar; indicatorLabels[key]=l
-end
-
-refreshIndicators = function()
-	for key,lbl in pairs(indicatorLabels) do
-		local f=features[key]; if not f then continue end
-		if not f.enabled then lbl.TextColor3=Color3.fromRGB(45,45,55)
-		elseif (key=="PixelSurf" or key=="TextureBug") and f.surfing then lbl.TextColor3=Color3.fromRGB(76,210,96)
-		else lbl.TextColor3=Color3.fromRGB(230,230,230) end
+local lastGunNameNS = nil
+local fpsCounter=0; RunService.RenderStepped:Connect(function(dt) 
+	fpsCounter=fpsCounter+1; if fpsCounter>=10 then fpsCounter=0; wmFps.Text=math.floor(1/math.max(dt,0.001)+0.5).." fps" end
+	-- No-spread override with gun change detection
+	if noSpreadActive then
+		local currentGun = getEquippedGunNameNS()
+		if currentGun ~= lastGunNameNS then
+			-- Gun changed! Rescan
+			if currentSpreadFolder then restoreSpreadNS(currentSpreadFolder) end
+			currentSpreadFolder = getCurrentSpreadFolder()
+			if currentSpreadFolder then saveOriginalsNS(currentSpreadFolder) end
+			lastGunNameNS = currentGun
+		end
+		if currentSpreadFolder then applyLowSpread(currentSpreadFolder) end
 	end
-end
-RunService.Heartbeat:Connect(refreshIndicators)
-
--- WASD
-local WASD_KEY_SIZE=20; local WASD_GAP=2
-local wasdBar=Instance.new("Frame"); wasdBar.AutomaticSize=Enum.AutomaticSize.XY; wasdBar.Position=UDim2.new(0.5,0,1,-38); wasdBar.AnchorPoint=Vector2.new(0.5,1); wasdBar.BackgroundColor3=Color3.fromRGB(10,10,12); wasdBar.BorderSizePixel=0; wasdBar.ZIndex=10; wasdBar.Parent=screenGui
-Instance.new("UICorner",wasdBar).CornerRadius=UDim.new(0,4); Instance.new("UIStroke",wasdBar).Color=Color3.fromRGB(30,30,38)
-local wasdPad=Instance.new("UIPadding",wasdBar); wasdPad.PaddingTop=UDim.new(0,4); wasdPad.PaddingBottom=UDim.new(0,4); wasdPad.PaddingLeft=UDim.new(0,4); wasdPad.PaddingRight=UDim.new(0,4)
-local WASD_ROW_W=3*WASD_KEY_SIZE+2*WASD_GAP
-local wasdRow1=Instance.new("Frame",wasdBar); wasdRow1.Size=UDim2.new(0,WASD_ROW_W,0,WASD_KEY_SIZE); wasdRow1.BackgroundTransparency=1; wasdRow1.BorderSizePixel=0; wasdRow1.ZIndex=10
-local wasdRow2=Instance.new("Frame",wasdBar); wasdRow2.Size=UDim2.new(0,WASD_ROW_W,0,WASD_KEY_SIZE); wasdRow2.Position=UDim2.new(0,0,0,WASD_KEY_SIZE+WASD_GAP); wasdRow2.BackgroundTransparency=1; wasdRow2.BorderSizePixel=0; wasdRow2.ZIndex=10
-local function makeKeyBox(parent,label,xOffset)
-	local box=Instance.new("Frame",parent); box.Size=UDim2.new(0,WASD_KEY_SIZE,0,WASD_KEY_SIZE); box.Position=UDim2.new(0,xOffset,0,0); box.BackgroundColor3=Color3.fromRGB(25,25,32); box.BorderSizePixel=0; box.ZIndex=11; Instance.new("UICorner",box).CornerRadius=UDim.new(0,3)
-	local s=Instance.new("UIStroke",box); s.Color=Color3.fromRGB(30,30,38); s.Thickness=1
-	local lbl=Instance.new("TextLabel",box); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=Color3.fromRGB(45,45,55); lbl.Font=Enum.Font.GothamMedium; lbl.TextSize=10; lbl.ZIndex=12
-	return box,lbl,s
-end
-local wBox,wLbl,wStroke=makeKeyBox(wasdRow1,"w",WASD_KEY_SIZE+WASD_GAP)
-local aBox,aLbl,aStroke=makeKeyBox(wasdRow2,"a",0)
-local sBox,sLbl,sStroke=makeKeyBox(wasdRow2,"s",WASD_KEY_SIZE+WASD_GAP)
-local dBox,dLbl,dStroke=makeKeyBox(wasdRow2,"d",(WASD_KEY_SIZE+WASD_GAP)*2)
-local function setKeyLit(box,lbl,stroke2,lit)
-	if lit then box.BackgroundColor3=Color3.fromRGB(30,80,40); stroke2.Color=Color3.fromRGB(76,210,96); lbl.TextColor3=Color3.fromRGB(76,210,96)
-	else box.BackgroundColor3=Color3.fromRGB(25,25,32); stroke2.Color=Color3.fromRGB(30,30,38); lbl.TextColor3=Color3.fromRGB(45,45,55) end
-end
-RunService.RenderStepped:Connect(function()
-	setKeyLit(wBox,wLbl,wStroke,UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up))
-	setKeyLit(aBox,aLbl,aStroke,UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left))
-	setKeyLit(sBox,sLbl,sStroke,UserInputService:IsKeyDown(Enum.KeyCode.S) or UserInputService:IsKeyDown(Enum.KeyCode.Down))
-	setKeyLit(dBox,dLbl,dStroke,UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right))
 end)
 
 ----------------------------------------------------------------------
@@ -1092,7 +996,6 @@ local function makeIcon(name,color,size)
 	return new("TextLabel",{BackgroundTransparency=1,Text=GLYPH[name] or "\u{2022}",TextColor3=color,Font=Enum.Font.GothamBold,TextSize=size,Size=UDim2.fromOffset(size,size),TextXAlignment=Enum.TextXAlignment.Center,TextYAlignment=Enum.TextYAlignment.Center})
 end
 
--- COLORS & SIZES
 local COLORS={
 	background=Color3.fromRGB(0,0,0),sidebar=Color3.fromRGB(0,0,0),panel=Color3.fromRGB(13,13,13),
 	panelStroke=Color3.fromRGB(26,26,26),windowStroke=Color3.fromRGB(22,22,22),accent=Color3.fromRGB(48,244,38),
@@ -1200,104 +1103,52 @@ end
 
 ----------------------------------------------------------------------
 -- DROPDOWN BUILDER
--- Returns the selected value via onChange(value)
 ----------------------------------------------------------------------
 local function buildDropdown(parent, labelTxt, options, currentValue, onChange)
 	local DROPDOWN_H = 26
-
 	local wrapper = Instance.new("Frame")
 	wrapper.Size = UDim2.new(1, 0, 0, 0)
 	wrapper.AutomaticSize = Enum.AutomaticSize.Y
 	wrapper.BackgroundTransparency = 1
 	wrapper.Parent = parent
-
-	-- Label row
 	local labelRow = Instance.new("Frame")
 	labelRow.Size = UDim2.new(1, 0, 0, DROPDOWN_H)
 	labelRow.BackgroundTransparency = 1
 	labelRow.Parent = wrapper
-
 	local lbl = Instance.new("TextLabel")
-	lbl.Text = labelTxt
-	lbl.Font = FONTS.label
-	lbl.TextSize = 13
-	lbl.TextColor3 = COLORS.labelOff
-	lbl.TextXAlignment = Enum.TextXAlignment.Left
-	lbl.TextYAlignment = Enum.TextYAlignment.Center
-	lbl.BackgroundTransparency = 1
-	lbl.Size = UDim2.new(0.45, 0, 1, 0)
-	lbl.Parent = labelRow
-
-	-- Button (shows current value)
+	lbl.Text = labelTxt; lbl.Font = FONTS.label; lbl.TextSize = 13; lbl.TextColor3 = COLORS.labelOff
+	lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.TextYAlignment = Enum.TextYAlignment.Center
+	lbl.BackgroundTransparency = 1; lbl.Size = UDim2.new(0.45, 0, 1, 0); lbl.Parent = labelRow
 	local btn = Instance.new("TextButton")
-	btn.Text = currentValue
-	btn.Font = FONTS.label
-	btn.TextSize = 12
-	btn.TextColor3 = COLORS.title
-	btn.BackgroundColor3 = COLORS.dropdownBg
-	btn.Size = UDim2.new(0.55, -4, 1, -4)
-	btn.Position = UDim2.new(0.45, 4, 0, 2)
-	btn.AutoButtonColor = false
-	btn.Parent = labelRow
-	corner(btn, 5)
-	stroke(btn, COLORS.divider, 1)
-
-	-- Arrow indicator
+	btn.Text = currentValue; btn.Font = FONTS.label; btn.TextSize = 12; btn.TextColor3 = COLORS.title
+	btn.BackgroundColor3 = COLORS.dropdownBg; btn.Size = UDim2.new(0.55, -4, 1, -4)
+	btn.Position = UDim2.new(0.45, 4, 0, 2); btn.AutoButtonColor = false; btn.Parent = labelRow
+	corner(btn, 5); stroke(btn, COLORS.divider, 1)
 	local arrow = Instance.new("TextLabel")
-	arrow.Text = "▾"
-	arrow.Font = FONTS.label
-	arrow.TextSize = 12
-	arrow.TextColor3 = COLORS.labelOff
-	arrow.BackgroundTransparency = 1
-	arrow.Size = UDim2.new(0, 16, 1, 0)
-	arrow.Position = UDim2.new(1, -18, 0, 0)
-	arrow.TextXAlignment = Enum.TextXAlignment.Center
-	arrow.Parent = btn
-
-	-- Options list (hidden by default)
+	arrow.Text = "▾"; arrow.Font = FONTS.label; arrow.TextSize = 12; arrow.TextColor3 = COLORS.labelOff
+	arrow.BackgroundTransparency = 1; arrow.Size = UDim2.new(0, 16, 1, 0)
+	arrow.Position = UDim2.new(1, -18, 0, 0); arrow.TextXAlignment = Enum.TextXAlignment.Center; arrow.Parent = btn
 	local optFrame = Instance.new("Frame")
-	optFrame.Size = UDim2.new(0.55, -4, 0, 0)
-	optFrame.AutomaticSize = Enum.AutomaticSize.Y
-	optFrame.Position = UDim2.new(0.45, 4, 0, DROPDOWN_H + 2)
-	optFrame.BackgroundColor3 = COLORS.dropdownBg
-	optFrame.BorderSizePixel = 0
-	optFrame.ZIndex = 50
-	optFrame.Visible = false
-	optFrame.Parent = wrapper
-	corner(optFrame, 5)
-	stroke(optFrame, COLORS.divider, 1)
-
+	optFrame.Size = UDim2.new(0.55, -4, 0, 0); optFrame.AutomaticSize = Enum.AutomaticSize.Y
+	optFrame.Position = UDim2.new(0.45, 4, 0, DROPDOWN_H + 2); optFrame.BackgroundColor3 = COLORS.dropdownBg
+	optFrame.BorderSizePixel = 0; optFrame.ZIndex = 50; optFrame.Visible = false; optFrame.Parent = wrapper
+	corner(optFrame, 5); stroke(optFrame, COLORS.divider, 1)
 	local optList = Instance.new("UIListLayout")
-	optList.FillDirection = Enum.FillDirection.Vertical
-	optList.Padding = UDim.new(0, 1)
-	optList.Parent = optFrame
-
+	optList.FillDirection = Enum.FillDirection.Vertical; optList.Padding = UDim.new(0, 1); optList.Parent = optFrame
 	local optPad = Instance.new("UIPadding")
 	optPad.PaddingTop = UDim.new(0, 3); optPad.PaddingBottom = UDim.new(0, 3)
-	optPad.PaddingLeft = UDim.new(0, 4); optPad.PaddingRight = UDim.new(0, 4)
-	optPad.Parent = optFrame
-
+	optPad.PaddingLeft = UDim.new(0, 4); optPad.PaddingRight = UDim.new(0, 4); optPad.Parent = optFrame
 	local isOpen = false
 	local function setOpen(open)
-		isOpen = open
-		optFrame.Visible = open
-		arrow.Text = open and "▴" or "▾"
+		isOpen = open; optFrame.Visible = open; arrow.Text = open and "▴" or "▾"
 	end
-
 	for _, opt in ipairs(options) do
 		local optBtn = Instance.new("TextButton")
-		optBtn.Text = opt
-		optBtn.Font = FONTS.label
-		optBtn.TextSize = 12
+		optBtn.Text = opt; optBtn.Font = FONTS.label; optBtn.TextSize = 12
 		optBtn.TextColor3 = opt == currentValue and COLORS.accent or COLORS.labelOff
-		optBtn.BackgroundColor3 = COLORS.dropdownBg
-		optBtn.BackgroundTransparency = 1
-		optBtn.Size = UDim2.new(1, 0, 0, 22)
-		optBtn.TextXAlignment = Enum.TextXAlignment.Left
-		optBtn.AutoButtonColor = false
-		optBtn.ZIndex = 51
-		optBtn.Parent = optFrame
-
+		optBtn.BackgroundColor3 = COLORS.dropdownBg; optBtn.BackgroundTransparency = 1
+		optBtn.Size = UDim2.new(1, 0, 0, 22); optBtn.TextXAlignment = Enum.TextXAlignment.Left
+		optBtn.AutoButtonColor = false; optBtn.ZIndex = 51; optBtn.Parent = optFrame
 		optBtn.MouseEnter:Connect(function()
 			TweenService:Create(optBtn, TweenInfo.new(0.1), {BackgroundTransparency = 0.5, BackgroundColor3 = COLORS.dropdownHover}):Play()
 		end)
@@ -1306,7 +1157,6 @@ local function buildDropdown(parent, labelTxt, options, currentValue, onChange)
 		end)
 		optBtn.MouseButton1Click:Connect(function()
 			btn.Text = opt
-			-- Reset all option colours
 			for _, child in ipairs(optFrame:GetChildren()) do
 				if child:IsA("TextButton") then child.TextColor3 = COLORS.labelOff end
 			end
@@ -1315,10 +1165,7 @@ local function buildDropdown(parent, labelTxt, options, currentValue, onChange)
 			onChange(opt)
 		end)
 	end
-
 	btn.MouseButton1Click:Connect(function() setOpen(not isOpen) end)
-
-	-- Close when clicking elsewhere
 	UserInputService.InputBegan:Connect(function(input, gpe)
 		if gpe then return end
 		if not isOpen then return end
@@ -1330,7 +1177,6 @@ local function buildDropdown(parent, labelTxt, options, currentValue, onChange)
 			end
 		end
 	end)
-
 	return wrapper
 end
 
@@ -1379,29 +1225,23 @@ function makePanel(colIndex,def)
 	local col=columns[colIndex]
 	local panel=Instance.new("Frame"); panel.Size=UDim2.new(1,0,0,0); panel.AutomaticSize=Enum.AutomaticSize.Y; panel.BackgroundColor3=COLORS.panel; panel.BorderSizePixel=0; panel.Parent=col
 	corner(panel,SIZES.corner); stroke(panel,COLORS.panelStroke,1); vlist(panel,10)
-
 	local header=Instance.new("Frame"); header.BackgroundColor3=COLORS.titleBox; header.BorderSizePixel=0; header.Size=UDim2.new(1,0,0,SIZES.titleH); header.LayoutOrder=1; header.Parent=panel
 	stroke(header,COLORS.divider,1); new("UIPadding",{PaddingLeft=UDim.new(0,10),Parent=header})
 	local headerLabel=Instance.new("TextLabel"); headerLabel.Text=def.title; headerLabel.Font=FONTS.title; headerLabel.TextSize=14; headerLabel.TextColor3=COLORS.title; headerLabel.TextXAlignment=Enum.TextXAlignment.Left; headerLabel.TextYAlignment=Enum.TextYAlignment.Center; headerLabel.BackgroundTransparency=1; headerLabel.Size=UDim2.fromScale(1,1); headerLabel.Parent=header
-
 	local rows=Instance.new("Frame"); rows.Size=UDim2.new(1,0,0,0); rows.AutomaticSize=Enum.AutomaticSize.Y; rows.BackgroundTransparency=1; rows.LayoutOrder=2; rows.Parent=panel
 	padding(rows,SIZES.panelPad); vlist(rows,SIZES.rowGap)
-
 	for i,item in ipairs(def.items) do
 		local rowH=SIZES.rowH
 		if item.slider then rowH=SIZES.rowH+28 end
 		if item.type=="keybind" then rowH=28 end
 		if item.type=="dropdown" then rowH=30 end
-
 		local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,rowH); row.BackgroundTransparency=1; row.Parent=rows
-
 		if item.type=="toggle" then
 			local toggleRow=Instance.new("Frame"); toggleRow.Size=UDim2.new(1,0,0,SIZES.rowH); toggleRow.BackgroundTransparency=1; toggleRow.Parent=row
 			local box=Instance.new("Frame"); box.AnchorPoint=Vector2.new(0,0.5); box.Position=UDim2.new(0,0,0.5,0); box.Size=UDim2.fromOffset(SIZES.checkbox,SIZES.checkbox); box.BackgroundColor3=COLORS.checkOff; box.BorderSizePixel=0; box.Parent=toggleRow; corner(box,5)
 			local boxStroke=stroke(box,COLORS.checkOffStroke,1)
 			local check=Instance.new("TextLabel"); check.Text="\u{2714}"; check.Font=Enum.Font.GothamBlack; check.TextSize=14; check.TextColor3=COLORS.check; check.BackgroundTransparency=1; check.Size=UDim2.fromScale(1,1); check.Parent=box
 			local label=Instance.new("TextLabel"); label.Text=item.label; label.Font=FONTS.label; label.TextSize=14; label.TextColor3=COLORS.labelOff; label.TextXAlignment=Enum.TextXAlignment.Left; label.TextYAlignment=Enum.TextYAlignment.Center; label.BackgroundTransparency=1; label.Position=UDim2.new(0,SIZES.labelStartX,0,0); label.Size=UDim2.new(1,-SIZES.labelStartX-22,1,0); label.Parent=toggleRow
-
 			if item.hint then
 				local override=keybindOverrides[item.key]
 				local keyName="auto"; local mode="auto"
@@ -1413,7 +1253,6 @@ function makePanel(colIndex,def)
 					createContextMenu(item.key,currentKey,currentMode,Vector2.new(x,y))
 				end)
 			end
-
 			local button=Instance.new("TextButton"); button.Text=""; button.BackgroundTransparency=1; button.Size=UDim2.fromScale(1,1); button.AutoButtonColor=false; button.Parent=toggleRow
 			local localState=item.init==true
 			local function getState() if item.key and features[item.key] then return features[item.key].enabled end; return localState end
@@ -1427,18 +1266,14 @@ function makePanel(colIndex,def)
 			render()
 			button.MouseButton1Click:Connect(function() setState(not getState()) end)
 			if item.slider then buildSlider(row,0,SIZES.rowH+2,item.sliderLabel or "value",item.min,item.max,item.init,90,item.onChange) end
-
 		elseif item.type=="dropdown" then
-			-- Inline dropdown row (no header checkbox)
 			buildDropdown(row, item.label, item.options, item.default, function(val)
 				if item.onChange then item.onChange(val) end
 			end)
 			row.Size = UDim2.new(1, 0, 0, 0)
 			row.AutomaticSize = Enum.AutomaticSize.Y
-
 		elseif item.type=="keybind" then
 			buildKeybind(row,item.label,item.currentKey or "MouseButton2")
-
 		elseif item.type=="label" then
 			local l=Instance.new("TextLabel"); l.Text=item.text; l.Font=FONTS.label; l.TextSize=14; l.TextColor3=COLORS.labelOff; l.BackgroundTransparency=1; l.Size=UDim2.new(1,0,0,20); l.Parent=row
 		end
@@ -1466,13 +1301,18 @@ local RECORDER_SOON={{col=1,title="recorder",items={{type="label",text="soon"}}}
 TAB_PANELS = {
 	aimbot = {
 		main = {
-			{col=1, title="main", items={
+			{col=1, title="aimbot", items={
 				{type="toggle",label="aimbot",key="FakeAimbot",slider=true,sliderLabel="smooth",min=1,max=100,init=cfg.aimbotSmooth,onChange=function(v) cfg.aimbotSmooth=v end},
 				{type="toggle",label="fov",key="fovToggle",slider=true,sliderLabel="fov",min=1,max=360,init=cfg.aimbotFOV,onChange=function(v) cfg.aimbotFOV=v end},
 				{type="keybind",label="keybind",currentKey=cfg.aimbotKeybind or "MouseButton2"},
 				{type="toggle",label="fov view",key="fovView"},
 				{type="label",text="change aimbot part (soon)"},
-			}}
+			}},
+			{col=2, title="no spread", items={
+				{type="toggle",label="no-spread",key="noSpread",onToggle=function(v) toggleNoSpreadFunc(v) end},
+				{type="toggle",label="min spread",key="_nsMin",slider=true,sliderLabel="min",min=1,max=20,init=cfg.noSpreadMin,onChange=function(v) cfg.noSpreadMin=v end},
+				{type="toggle",label="max spread",key="_nsMax",slider=true,sliderLabel="max",min=5,max=50,init=cfg.noSpreadMax,onChange=function(v) cfg.noSpreadMax=v end},
+			}},
 		}
 	},
 	visuals = {
@@ -1485,43 +1325,19 @@ TAB_PANELS = {
 			{col=1, title="hud", items={
 				{type="toggle",label="watermark",      key="wm",       init=true, onToggle=function(v) wmFrame.Visible=v end},
 				{type="toggle",label="larp watermark", key="larp",                onToggle=function(v) toggleLarpWatermark(v) end},
-				{type="toggle",label="velocity graph", key="velGraph",            onToggle=function(v) toggleVelocityGraph(v) end},
 				{type="toggle",label="momentum",       key="mom",                 onToggle=function(v) toggleMomentum(v) end},
-				{type="toggle",label="indicators",     key="ind",      init=true, onToggle=function(v) indBar.Visible=v; wasdBar.Visible=v end},
 			}},
-			-- Second column: random / fun stuff including spinbot
 			{col=2, title="random", items={
-				-- Master spinbot toggle
-				{type="toggle", label="spinbot", key="Spinbot",
-				 onToggle=function(v)
-					-- When toggled, restart with current mode
-					if v then
-						-- already toggled by toggleFeature, just ensure mode is applied
-					end
-				 end},
-				-- Mode dropdown (visible always, controls cfg.spinMode)
-				{type="dropdown", label="mode",
-				 options={"Body Only","Head Only","Both"},
-				 default=cfg.spinMode,
-				 onChange=function(val)
+				{type="toggle", label="spinbot", key="Spinbot"},
+				{type="dropdown", label="mode", options={"Body Only","Head Only","Both"}, default=cfg.spinMode, onChange=function(val)
 					cfg.spinMode = val
-					-- Restart spinbot if currently active so new mode applies live
 					if features.Spinbot.enabled then
 						spinbot_stop()
 						spinbot_start()
 					end
-				 end},
-				-- Speed slider for body spin
-				{type="toggle", label="speed",
-				 key="_spinSpeed", -- dummy key, we just use slider
-				 slider=true, sliderLabel="deg/s",
-				 min=60, max=2000, init=cfg.spinSpeed,
-				 onChange=function(v)
-					cfg.spinSpeed = v
-				 end},
-				-- HUD remover
-				{type="toggle", label="hud remover", key="hudRemove",
-				 onToggle=function(v) setHudRemoved(v) end},
+				end},
+				{type="toggle", label="speed", key="_spinSpeed", slider=true, sliderLabel="deg/s", min=60, max=2000, init=cfg.spinSpeed, onChange=function(v) cfg.spinSpeed = v end},
+				{type="toggle", label="hud remover", key="hudRemove", onToggle=function(v) setHudRemoved(v) end},
 			}},
 		}
 	},
@@ -1622,9 +1438,10 @@ UserInputService.InputBegan:Connect(function(input,gpe)
 		if unloadHeld[Enum.KeyCode.U] and unloadHeld[Enum.KeyCode.O] then
 			for key in pairs(features) do stopFeature(key) end
 			toggleESP(false); stopSkinLoop(); toggleLarpWatermark(false); toggleMomentum(false)
-			toggleVelocityGraph(false); setHudRemoved(false)
+			setHudRemoved(false)
 			setFog(false); setBlur(false)
 			if fogConn then fogConn:Disconnect() end; if blurConn then blurConn:Disconnect() end
+			if noSpreadActive and currentSpreadFolder then restoreSpreadNS(currentSpreadFolder) end
 			trailFolder:Destroy(); screenGui:Destroy()
 			UserInputService.MouseBehavior=Enum.MouseBehavior.Default; UserInputService.MouseIconEnabled=true
 		end
@@ -1637,7 +1454,12 @@ UserInputService.InputEnded:Connect(function(input) unloadHeld[input.KeyCode]=ni
 ----------------------------------------------------------------------
 player.CharacterAdded:Connect(function(char)
 	bindCharacter(char); task.wait(0.5)
-	originalNeckC0=nil -- Reset so spinbot grabs fresh neck C0 after respawn
+	if noSpreadActive then
+		if currentSpreadFolder then restoreSpreadNS(currentSpreadFolder) end
+		currentSpreadFolder = getCurrentSpreadFolder()
+		if currentSpreadFolder then saveOriginalsNS(currentSpreadFolder) end
+	end
+	originalNeckC0=nil
 	for key,f in pairs(features) do if f.enabled then
 		local restart=nil
 		if     key=="PixelSurf"  then restart=function() makeSurf(key,Vector3.new(0,0,0),   function() return cfg.pixelMaxSpeed   end) end
@@ -1654,7 +1476,7 @@ player.CharacterAdded:Connect(function(char)
 	if espEnabled then refreshESP() end
 	if momentumEnabled then toggleMomentum(false); toggleMomentum(true) end
 	if hudRemoved then
-		task.wait(1) -- wait for game HUDs to reload before hiding them again
+		task.wait(1)
 		setHudRemoved(true)
 	end
 end)
